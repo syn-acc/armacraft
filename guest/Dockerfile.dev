@@ -1,0 +1,32 @@
+# armacraft guest DEV environment (not the shipped image; see guest/Dockerfile for that).
+#
+# Toolchain + a pristine upstream checkout only. Everything that changes lives outside the image:
+#   /work   named volume armacraft-guest-dev-work: patched tree, out-of-tree build dir,
+#           install prefix, ccache. Survives container recreation.
+#   /guest  bind mount of guest/ (read-only): src/, patches/, server/, dev/*.sh
+# guest/dev/build.sh does incremental builds, guest/dev/supervise.sh keeps the server running.
+# Driven by dev/guest.ps1, which passes ARMA_REF/ARMA_COMMIT parsed from guest/Dockerfile so
+# the upstream pin has one source of truth.
+
+ARG BASE=ubuntu:24.04
+FROM ${BASE}
+RUN apt-get -y update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      ca-certificates git autoconf automake patch bash bison bzip2 g++ make libtool \
+      libxml2-dev libzthread-dev pkg-config python3 \
+      ccache mold procps \
+ && rm -rf /var/lib/apt/lists/*
+
+ARG ARMA_REPO=https://gitlab.com/armagetronad/armagetronad.git
+ARG ARMA_REF=v0.2.9.3.0
+ARG ARMA_COMMIT=036daaf34f055b1efbcee6a4afc4d90a325ce569
+RUN git clone --depth 1 --branch "${ARMA_REF}" "${ARMA_REPO}" /opt/arma-pristine \
+ && cd /opt/arma-pristine \
+ && test "$(git rev-parse HEAD)" = "${ARMA_COMMIT}" \
+ || { echo "upstream ${ARMA_REF} is not at pinned commit ${ARMA_COMMIT}" >&2; exit 1; }
+
+# same version stamping as the release build (batch/make/version -> "0.2.9.3.0")
+ENV ARMA_REF=${ARMA_REF} CI_COMMIT_REF_PROTECTED=true CI_COMMIT_TAG=${ARMA_REF} \
+    CCACHE_DIR=/work/ccache CCACHE_MAXSIZE=2G CCACHE_COMPILERCHECK=content
+
+EXPOSE 4534/udp 4535/tcp
+CMD ["/bin/bash", "/guest/dev/supervise.sh"]

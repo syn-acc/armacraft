@@ -1,0 +1,141 @@
+diff --git a/src/Makefile.am b/src/Makefile.am
+index 9c6ce7a..1c615fe 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -110,6 +110,7 @@ libtron_a_SOURCES=tron/gAIBase.cpp tron/gAIBase.h tron/gAICharacter.cpp tron/gAI
+ 	tron/gSensor.cpp tron/gSensor.h tron/gServerBrowser.cpp tron/gServerBrowser.h tron/gSparks.cpp tron/gSparks.h\
+ 	tron/gSpawn.cpp tron/gSpawn.h tron/gStuff.cpp tron/gStuff.h tron/gTeam.cpp tron/gTeam.h tron/gWall.cpp\
+ 	tron/gWall.h tron/gWinZone.cpp tron/gWinZone.h\
++	tron/gBridge.cpp tron/gBridge.h\
+ 	tron/gFriends.h tron/gFriends.cpp\
+ 	tron/gServerFavorites.h tron/gServerFavorites.cpp
+ 
+diff --git a/src/engine/ePlayer.cpp b/src/engine/ePlayer.cpp
+index 17f7771..27c8738 100644
+--- a/src/engine/ePlayer.cpp
++++ b/src/engine/ePlayer.cpp
+@@ -2829,6 +2829,9 @@ tSettingItem< bool > se_coloredTeamConf( "FILTER_COLOR_TEAM", se_filterColorTeam
+ static bool se_filterDarkColorTeam=false;
+ tSettingItem< bool > se_coloredDarkTeamConf( "FILTER_DARK_COLOR_TEAM", se_filterDarkColorTeam );
+ 
++// armacraft: optional observer of public chat lines
++void (*se_chatObserver)( ePlayerNetID * sender, tString const & say ) = 0;
++
+ // regular chat; reaches all players
+ static void se_ChatShout( ePlayerNetID * p, tString const & say, eChatSpamTester & spam )
+ {
+@@ -2851,6 +2854,9 @@ static void se_ChatShout( ePlayerNetID * p, tString const & say, eChatSpamTester
+         tString s;
+         s << p->GetUserName() << ' ' << say;
+         se_SaveToChatLog(s);
++
++        if ( se_chatObserver )
++            se_chatObserver( p, say );
+     }
+ }
+ 
+diff --git a/src/engine/ePlayer.h b/src/engine/ePlayer.h
+index 08b8ac4..ca1f79d 100644
+--- a/src/engine/ePlayer.h
++++ b/src/engine/ePlayer.h
+@@ -518,6 +518,9 @@ private:
+ };
+ 
+ extern tList<ePlayerNetID> se_PlayerNetIDs;
++
++//! armacraft: optional observer of public chat lines (set by the bridge module)
++extern void (*se_chatObserver)( ePlayerNetID * sender, tString const & say );
+ extern int    sr_viewportBelongsToPlayer[MAX_VIEWPORTS];
+ 
+ void se_ChatState( ePlayerNetID::ChatFlags flag, bool cs);
+diff --git a/src/tron/gCycleMovement.h b/src/tron/gCycleMovement.h
+index c703a95..bc7cf09 100644
+--- a/src/tron/gCycleMovement.h
++++ b/src/tron/gCycleMovement.h
+@@ -75,6 +75,7 @@ struct gRealColor {
+ //! class handling lightcycle movement aspects ( not networking beyond construction, no rendering, no wall building )
+ class gCycleMovement : public eNetGameObject
+ {
++    friend class gBridge; // armacraft: reads enemyInfluence for death events
+ public:
+     // accessors
+     static float            RubberSpeed             ()                                              ;   //!< returns the rubber speed (decay rate of the distance to the wall in front)
+diff --git a/src/tron/gGame.cpp b/src/tron/gGame.cpp
+index af3ac9a..f2fbd0a 100644
+--- a/src/tron/gGame.cpp
++++ b/src/tron/gGame.cpp
+@@ -71,6 +71,7 @@ Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307, USA.
+ #include "rScreen.h"
+ 
+ #include "gParser.h"
++#include "gBridge.h"
+ #include "tResourceManager.h"
+ #include "nAuthentication.h"
+ 
+@@ -1349,6 +1350,10 @@ int sg_NumHumans()
+             humans++;
+     }
+ 
++    // armacraft: a connected bridge host keeps the server from waiting for humans
++    if ( humans == 0 && sg_BridgeNumUsers() > 0 )
++        humans = 1;
++
+     return humans;
+ }
+ 
+@@ -1356,7 +1361,7 @@ int sg_NumUsers()
+ {
+     // return se_PlayerNetIDs.Len() ;
+ #ifdef DEDICATED
+-    return sn_NumUsers();
++    return sn_NumUsers() + sg_BridgeNumUsers();
+ #else
+     return sn_NumUsers() + 1;
+ #endif
+@@ -3024,6 +3029,7 @@ void gGame::NetSync(){
+ 
+ void gGame::NetSyncIdle(){
+     NetSync();
++    sg_BridgeIdle(); // armacraft
+     sn_Delay();
+ }
+ 
+@@ -3289,6 +3295,8 @@ void gGame::StateUpdate(){
+                 }
+             }
+ 
++            sg_BridgeRoundStart( this ); // armacraft
++
+             // do the first analysis of the round, now is the time to get it used to the number of teams
+             Analysis( -1000 );
+ 
+@@ -3469,6 +3477,7 @@ void gGame::StateUpdate(){
+ 
+             gHighscoresBase::SaveAll();
+             con << tOutput("$gamestate_deleting_objects");
++            sg_BridgeRoundEnd( this ); // armacraft
+             exit_game_objects(grid);
+             st_ToDo( sg_VoteMenuIdle );
+             nNetObject::ClearAllDeleted();
+@@ -4588,6 +4597,9 @@ void sg_EnterGameCore( nNetState enter_state ){
+ 
+         goon=GameLoop();
+ 
++        if ( sg_currentGame )
++            sg_BridgeFrame( sg_currentGame ); // armacraft
++
+         st_DoToDo();
+     }
+ 
+diff --git a/src/tron/gWall.h b/src/tron/gWall.h
+index 68264af..199865d 100644
+--- a/src/tron/gWall.h
++++ b/src/tron/gWall.h
+@@ -147,6 +147,7 @@ private:
+ // the sn_netObjects that represents eWalls across the network.
+ class gNetPlayerWall: public tListItem< gNetPlayerWall >, public nNetObject{
+     friend class gCycle;
++    friend class gBridge; // armacraft: reads hole coordinates
+     int id,griddedid;
+ 
+     tCONTROLLED_PTR(gCycle) cycle_;       // our cycle

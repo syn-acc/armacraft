@@ -1,0 +1,192 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+repositories {
+	mavenCentral()
+	// Iris API (compile only, render/IrisCompat): Modrinth's maven, nothing else from there
+	exclusiveContent {
+		forRepository {
+			maven {
+				name = "Modrinth"
+				url = "https://api.modrinth.com/maven"
+			}
+		}
+		filter {
+			includeGroup "maven.modrinth"
+		}
+	}
+}
+
+// Not shipped: the client game test (src/gametest), configured below once loom has created the client source set.
+sourceSets.create("gametest")
+
+// Split environment source sets so this can later be merged into host/ as one jar:
+// src/main = common (nothing server-only lives here), src/client = client-only.
+loom {
+	splitEnvironmentSourceSets()
+
+	mods {
+		"armacraft_client" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+		"armacraft_client-gametest" {
+			sourceSet sourceSets.gametest
+		}
+	}
+
+	runs {
+		// ./gradlew runClient
+		//   Any -Parmacraft.dev<Name>=<value> becomes -Darmacraft.dev<Name>=<value> (see dev/DevTools.java), e.g.
+		//   -Parmacraft.devWorld=armacraft_dev -Parmacraft.devJoin=true -Parmacraft.devShots=4
+		// ./gradlew runClientGametest : real dev client + the host mod jar. "relay": singleplayer, host relay against an
+		// in-process delta guest (ephemeral port). "ride": host ride mode with these visuals in a generated world.
+		// Screenshots in build/clientGametest/screenshots.
+		clientGametest {
+			client()
+			name = "Client Game Test"
+			source sourceSets.gametest
+			vmArg "-Dfabric.client.gametest"
+			vmArg "-Darmacraft.autoConnect=false"
+			// -Parmacraft_client.gametest=relay|ride runs one of the two tests; -Parmacraft_client.gametest.seed=<seed> for ride
+			project.properties.each { k, v ->
+				if (k.toString().startsWith("armacraft_client.gametest")) {
+					vmArg "-D${k}=${v}"
+				}
+			}
+			runDir "build/clientGametest"
+			ideConfigGenerated false
+		}
+
+		client {
+			programArgs "--username", "Syn", "--width", "1280", "--height", "720"
+			project.properties.each { k, v ->
+				if (k.toString().startsWith("armacraft.dev")) {
+					vmArg "-D${k}=${v}"
+				}
+			}
+		}
+	}
+}
+
+// armacraft (host/, MIT) is a hard dependency ("depends": {"armacraft": "*"}); both jars are installed together.
+// Classes shared with it live in host/ only and are compiled against here, never packaged (two jars must never
+// ship the same class name): the relay payload gl.syn.armacraft.relay.BridgePayload and the ride-visuals API
+// gl.syn.armacraft.client.ride.api (implemented here, entrypoint "armacraft:ride_visuals"). -Parmacraft.hostDir=<path> builds against another copy of host/ (default ../host);
+// -Parmacraft.hostJar=<jar> picks the host mod jar loaded by runClient (default: hostDir/build/libs).
+def hostDir = file(project.findProperty("armacraft.hostDir") ?: "../host")
+def hostJar = file(project.findProperty("armacraft.hostJar") ?: (new File(hostDir, "build/libs").listFiles()?.find {
+	it.name ==~ /armacraft-[0-9][^-]*\.jar/
+} ?: "${hostDir}/build/libs/armacraft-missing.jar"))
+// -Parmacraft.hostRuntimeJar=<jar>: run against a different host jar than the one compiled against (e.g. an older host)
+def hostRuntimeJar = file(project.findProperty("armacraft.hostRuntimeJar") ?: hostJar)
+
+sourceSets {
+	gametest {
+		compileClasspath += sourceSets.client.compileClasspath + sourceSets.client.output + sourceSets.main.output
+		runtimeClasspath += sourceSets.client.runtimeClasspath + sourceSets.client.output + sourceSets.main.output
+	}
+	hostApi {
+		java {
+			srcDir new File(hostDir, "src/main/java")
+			srcDir new File(hostDir, "src/client/java")
+			include "gl/syn/armacraft/relay/BridgePayload.java"
+			include "gl/syn/armacraft/client/ride/api/**"
+		}
+	}
+}
+// hostApi compiles against the client classpath as captured here, before its own output is added (no cycle).
+// main (common) has no Java: everything that needs host classes is client code.
+sourceSets.hostApi.compileClasspath += sourceSets.client.compileClasspath
+sourceSets.client.compileClasspath += sourceSets.hostApi.output
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+	// optional: assigns ArmaRenderTypes pipelines to shaderpack programs when Iris is installed (render/IrisCompat)
+	clientCompileOnly "maven.modrinth:iris:${project.iris_version}"
+
+	testImplementation platform("org.junit:junit-bom:${project.junit_version}")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+
+	// dev runs (runClient, runClientGametest): the host mod itself, as a mod jar on the runtime classpath. The game
+	// test also compiles against it (it drives the host's bridge); test code only, never packaged.
+	if (hostRuntimeJar.isFile()) {
+		clientRuntimeOnly files(hostRuntimeJar)
+	}
+	if (hostJar.isFile()) {
+		gametestCompileOnly files(hostJar)
+	}
+}
+
+sourceSets {
+	test {
+		compileClasspath += sourceSets.client.compileClasspath + sourceSets.client.output
+		// the host api sources first: a stale host jar on the client runtime classpath must not shadow them
+		runtimeClasspath = sourceSets.hostApi.output + runtimeClasspath + sourceSets.client.runtimeClasspath + sourceSets.client.output
+	}
+}
+
+processGametestResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+	it.options.encoding = "UTF-8"
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+jar {
+	from("LICENSE") {
+		rename { "${it}_armacraft_client" }
+	}
+	from("NOTICE.md") {
+		rename { "NOTICE_armacraft_client.md" }
+	}
+}
+
+// Two jars must never ship the same class name: fail the build if this jar has a class the host jar also has.
+def checkHostCollisions = tasks.register("checkHostCollisions") {
+	def ours = tasks.named("jar").flatMap { it.archiveFile }
+	def host = hostJar
+	inputs.file(ours)
+	onlyIf { host.isFile() }
+	doLast {
+		def classes = { File f -> new java.util.zip.ZipFile(f).withCloseable { z -> z.entries().collect { it.name }.findAll { it.endsWith(".class") } as Set } }
+		def clash = classes(ours.get().asFile).intersect(classes(host))
+		if (!clash.isEmpty()) {
+			throw new GradleException("classes shipped by both armacraft_client and armacraft (" + host + "): " + clash.sort())
+		}
+	}
+}
+tasks.named("check") { dependsOn checkHostCollisions }
+
+test {
+	useJUnitPlatform()
+	testLogging {
+		events "passed", "failed", "skipped"
+		exceptionFormat "full"
+	}
+}

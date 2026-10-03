@@ -1,0 +1,70 @@
+# armacraft remote stack: PROPOSAL, NOT DEPLOYED. See deploy/README.md.
+# Target: /data/armacraft on uk (or one RCL fleet host). Needs Jamie's explicit go-ahead to run.
+#
+#   ARMACRAFT_TAG      guest image tag (armacraft-guest:<tag>, loaded via `docker load`)
+#   ARMACRAFT_MC_TAG   MC runtime image tag (built from deploy/mc.Dockerfile)
+# Both live in /data/armacraft/.env together with PREV_* for rollback.
+#
+# The bridge (4535/tcp) is NEVER published. Protocol v1 has no auth token and its `cmd`
+# message is owner-level console access. Only the mc service reaches it, over the
+# project network, by the DNS name `guest`.
+
+name: armacraft
+
+x-logging: &logging
+  driver: json-file
+  options: { max-size: "10m", max-file: "3" }   # uk /data is shared and has a 20 GB free-space guard
+
+services:
+  guest:
+    image: armacraft-guest:${ARMACRAFT_TAG:?set ARMACRAFT_TAG in .env}
+    restart: unless-stopped
+    # guest/server/*.cfg from the same git tag. Prod overrides: SERVER_NAME, and BRIDGE_ALLOW_CMD 0
+    # unless /arma cmd is really wanted in production.
+    volumes:
+      - ./guest-server:/etc/armacraft:ro
+    ports:
+      - "4534:4534/udp"          # real Armagetron clients (drop this line for MC-only)
+      # - "127.0.0.1:4535:4535"  # debugging only, localhost only, never 0.0.0.0
+    expose:
+      - "4535"                   # bridge, project network only
+    healthcheck:
+      # runtime image has bash but no python/curl: hello must arrive within 2 s
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/4535 && timeout 2 head -c 256 <&3 | grep -q '\"hello\"'"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    mem_limit: 256m
+    cpus: 1.0
+    logging: *logging
+
+  mc:
+    image: armacraft-mc:${ARMACRAFT_MC_TAG:?set ARMACRAFT_MC_TAG in .env}
+    build:
+      context: .
+      dockerfile: mc.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      guest:
+        condition: service_healthy
+    ports:
+      - "25565:25565/tcp"
+    volumes:
+      # world, server.properties, eula.txt (written by Jamie, never by tooling), config/armacraft.json
+      # with "host": "guest", "port": 4535. RCON, if enabled, stays unpublished.
+      - ./mc-data:/data
+      # versioned jars fetched from MinIO by deploy.sh; mods/ contains symlinks to the active set
+      - ./mods:/data/mods:ro
+    environment:
+      JAVA_OPTS: "-Xms1G -Xmx3G -XX:+UseG1GC"
+    stop_grace_period: 60s       # world save on SIGTERM
+    healthcheck:
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/25565"]
+      interval: 20s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+    mem_limit: 4g
+    cpus: 2.0
+    logging: *logging

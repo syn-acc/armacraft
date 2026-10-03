@@ -1,0 +1,194 @@
+armacraft graphics patch 0002 -- UNAPPLIED. Ride trails are never lowered (CAMERA_VISIBILITY_LOWER_WALL is rim-only).
+
+User decision (2026-10-02): keep the ride trail full height, like Armagetron. In Armagetron 0.4 the camera-visibility
+lowering is implemented only for rim walls (gWallRim::OnBlocksCamera, gWall.cpp 504-526); player walls inherit the
+no-op (eWall.cpp 319), so a cycle's own wall is never lowered. ArmaTrailVisual applied the rim rule to ride trails
+whenever the ride camera was active and CAMERA_VISIBILITY_LOWER_WALL was on (the default 1, and the fallback for this
+user's profile), so the corner wall behind the bike dropped to ~half height right after every turn.
+
+Change:
+- ArmaTrailVisual: no lowering at all. Removed the per-segment lowering state (`lowered` map, loweredHeight,
+  segmentKey) and the sight-line test; every segment is drawn at the ribbon height. The rule is stated in
+  `lowersTrailWalls(rideCameraActive, cameraVisibilityLowerWall)`, which returns false for every input.
+- Arena mode is untouched: rim walls are still lowered by ArenaRenderer / ArenaMesher (separate code).
+- ArmaTrailVisualTest.rideTrailsAreNeverLowered: the rule holds for camera active + LOWER_WALL 1, and the other
+  combinations.
+The `blocksPerUnit` constructor argument stays, so ArmaRideVisuals and the tests compile unchanged.
+
+Checked (2026-10-02, scratch copy of client/ as of 16:30 BST, built against host/):
+- git apply --check against client/: clean.
+- ./gradlew jar test: BUILD SUCCESSFUL, 67 tests, 0 failures (1 skipped, pre-existing).
+- In game (play-shaders-tex, Complementary + Euphoria, 1468x900) with the patched jar and
+  ride.arma_settings.CAMERA_VISIBILITY_LOWER_WALL forced to "1": screenshots taken 0.35 s after turns, from the
+  chase camera behind the bike, show the corner wall at full height:
+  .work/play-shaders-tex/run-client/screenshots/bench_user1_trail_behind_{day_a,day_b,sunset,night}.png
+Apply from the repo root:  git apply docs/graphics-patches/0002-client-ride-trails-never-lowered.patch
+
+diff --git a/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java b/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java
+index 421c032..b452956 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java
++++ b/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java
+@@ -24,6 +24,11 @@ import net.minecraft.world.phys.Vec3;
+  * vertically at the block edge where the ground changes, so walls step up and down with the terrain instead of
+  * slanting through blocks; falls keep their slope. Texture coordinates are anchored in world space, so the pattern
+  * does not slide when the tail is trimmed. The oldest {@code fadeLength} blocks fade towards the tail.
++ *
++ * <p>Ride trails are player walls and are always drawn at full height: Armagetron 0.4 lowers only rim walls for
++ * CAMERA_VISIBILITY_LOWER_WALL (gWallRim::OnBlocksCamera, gWall.cpp 504-526; player walls inherit the no-op at
++ * eWall.cpp 319), so the setting does not apply here (see {@link #lowersTrailWalls}). Arena rim walls keep it
++ * (ArenaRenderer / ArenaMesher).
+  */
+ public final class ArmaTrailVisual implements TrailVisual {
+ 
+@@ -33,11 +38,9 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 	/** Subdivisions of the head section (Armagetron: segs 5). */
+ 	private static final int HEAD_SEGS = 8;
+ 
+-	/** Physics blocks per unit (the camera's), for the camera height in CAMERA_VISIBILITY_LOWER_WALL. */
++	/** Physics blocks per unit of the ride (kept for the constructor contract; the trail itself uses the ribbon height). */
+ 	private final java.util.function.DoubleSupplier blocksPerUnit;
+ 	private final BikeGlow glow = new BikeGlow();
+-	/** CAMERA_VISIBILITY_LOWER_WALL state per trail segment: {render height (units), lastUpdate, lastSeen}. */
+-	private final java.util.Map<Long, double[]> lowered = new java.util.HashMap<>();
+ 	// scratch polyline (render thread only)
+ 	private double[] px = new double[256];
+ 	private double[] py = new double[256];
+@@ -92,10 +95,6 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 		double ppx = px[n - 1] - hdx * ArenaMesher.CYCLE_LEN * s;
+ 		double ppz = pz[n - 1] - hdz * ArenaMesher.CYCLE_LEN * s;
+ 
+-		// CAMERA_VISIBILITY_LOWER_WALL: walls crossing the sight line from the bike to the ride camera are lowered
+-		ArmaChaseCamera rideCam = ArmaRideVisuals.CAMERA;
+-		boolean lowering = rideCam.active() && rideCam.lowerWall();
+-		double now = ArmaBikeVisual.gameSeconds();
+ 		Mesh quads = new Mesh();
+ 		Mesh lines = new Mesh();
+ 		double ox = px[n - 1];
+@@ -110,10 +109,7 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 				continue;
+ 			}
+ 			double intensity = run > 1e-6 ? .7 + .3 * (hx * hx) / (run * run) : 1;
+-			double hSeg = h;
+-			if (lowering && run > 1e-6 && !(head && i == n - 2)) {
+-				hSeg = Math.min(h, loweredHeight(i, trail, s, h, rideCam, now));
+-			}
++			double hSeg = h; // never lowered: see lowersTrailWalls
+ 			// head section: subdivide so the curve is smooth
+ 			double fromHeadA = total - dist[i];
+ 			double fromHeadB = total - dist[i + 1];
+@@ -140,9 +136,6 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 					r0 * intensity, g0 * intensity, b0 * intensity, Math.min(va[5], vb[5]));
+ 			}
+ 		}
+-		if (lowered.size() > 0 && Double.isFinite(now)) {
+-			lowered.values().removeIf(v -> now - v[2] > 2 || now < v[2] - 1);
+-		}
+ 		if (head && ArmaRideVisuals.cfg().trailLight && ArmaRideVisuals.cfg().light) {
+ 			trailGlow(out, poseStack, cam, dist, total, trail);
+ 		}
+@@ -159,70 +152,6 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 		}
+ 	}
+ 
+-	/**
+-	 * Render height (blocks) of polyline segment i under CAMERA_VISIBILITY_LOWER_WALL. In Armagetron 0.4 only rim walls
+-	 * implement the lowering (gWallRim::OnBlocksCamera, gWall.cpp 504-526; player walls inherit the no-op at
+-	 * eWall.cpp 319); ride mode has no rim, so the same rule is applied to trail walls: when the segment crosses the
+-	 * bike-to-camera sight line at fraction {@code time} from the bike, the eCameraSensor height limit
+-	 * {@code .5 * (.5 * zLimit * time + objectZ * (1 - time))} (eCamera.cpp 1098-1103, objectZ = 2 * CamZ = 1.5, zLimit =
+-	 * camera height) applies if the wall is taller than half of it (1106); the wall drops to the limit at once (not
+-	 * below .25), holds for .2 s and regrows with {@code h *= 1 + 10 ts; h += 5 ts} (gWall.cpp 466-482).
+-	 */
+-	private double loweredHeight(int i, Ribbon trail, double s, double h, ArmaChaseCamera rideCam, double now) {
+-		long key = segmentKey(i, trail.rgb());
+-		double[] st = lowered.get(key);
+-		double wallUnits = h / s;
+-		double phys = blocksPerUnit.getAsDouble();
+-		double zLimit = rideCam.eyeZUnits() * (phys > 0 ? phys : s) / s; // camera height in this trail's units
+-		Vec3 eye = rideCam.eye();
+-		Vec3 obj = rideCam.bike();
+-		// sight line O -> E against segment P -> Q, horizontal plane
+-		double ex = eye.x - obj.x, ez = eye.z - obj.z;
+-		double qx = px[i + 1] - px[i], qz = pz[i + 1] - pz[i];
+-		double den = ex * qz - ez * qx;
+-		if (Math.abs(den) > 1e-9) {
+-			double wx = px[i] - obj.x, wz = pz[i] - obj.z;
+-			double time = (wx * qz - wz * qx) / den;
+-			double u = (wx * ez - wz * ex) / den;
+-			if (time > 0.02 && time <= 1 && u >= 0 && u <= 1) {
+-				double limit = .5 * (.5 * zLimit * time + 1.5 * (1 - time));
+-				if (wallUnits > limit * .5) {
+-					if (st == null) {
+-						st = new double[] {wallUnits, now, now};
+-						lowered.put(key, st);
+-					}
+-					st[0] = Math.max(.25, Math.min(st[0], limit));
+-					st[1] = now + .2;
+-				}
+-			}
+-		}
+-		if (st == null) {
+-			return h;
+-		}
+-		st[2] = now;
+-		double ts = now - st[1];
+-		if (ts > 0) {
+-			ts = Math.max(ts, 1e-5);
+-			st[1] = now;
+-			if (st[0] < .25) {
+-				st[0] = .25;
+-			}
+-			st[0] *= 1 + 10 * ts;
+-			st[0] += 5 * ts;
+-			if (st[0] >= wallUnits) {
+-				lowered.remove(key);
+-				return h;
+-			}
+-		}
+-		return st[0] * s;
+-	}
+-
+-	private long segmentKey(int i, int rgb) {
+-		long a = Math.round(px[i] * 64) * 31 + Math.round(pz[i] * 64);
+-		long b = Math.round(px[i + 1] * 64) * 31 + Math.round(pz[i + 1] * 64);
+-		return (a * 1_000_003L + b) * 31 + rgb;
+-	}
+-
+ 	/** Faint light along the newest blocks of the trail (the bike's own pool covers the head itself). */
+ 	private void trailGlow(SubmitNodeCollector out, PoseStack poseStack, Vec3 cam, double[] dist, double total, Ribbon trail) {
+ 		var c = ArmaRideVisuals.cfg();
+@@ -401,6 +330,15 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 		n++;
+ 	}
+ 
++	/**
++	 * Whether ride trail walls are lowered where they cross the bike-to-camera sight line. Never: in Armagetron 0.4
++	 * CAMERA_VISIBILITY_LOWER_WALL lowers rim walls only (player walls are never lowered), whatever the camera
++	 * setting and whether the ride camera is active. Arena rim walls are lowered by the arena renderer.
++	 */
++	static boolean lowersTrailWalls(boolean rideCameraActive, boolean cameraVisibilityLowerWall) {
++		return false;
++	}
++
+ 	private static double sq(double v) {
+ 		return v * v;
+ 	}
+diff --git a/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java b/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java
+index 98a2917..78d4e91 100644
+--- a/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java
++++ b/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java
+@@ -53,6 +53,14 @@ class ArmaTrailVisualTest {
+ 		assertEquals(0.5, c[c.length - 1][2], 1e-9, "the corner is not drawn before the bike reaches it");
+ 	}
+ 
++	@Test
++	void rideTrailsAreNeverLowered() {
++		// Armagetron 0.4: CAMERA_VISIBILITY_LOWER_WALL lowers rim walls only; player walls (ride trails) stay full height
++		assertFalse(ArmaTrailVisual.lowersTrailWalls(true, true), "camera active, CAMERA_VISIBILITY_LOWER_WALL 1");
++		assertFalse(ArmaTrailVisual.lowersTrailWalls(true, false));
++		assertFalse(ArmaTrailVisual.lowersTrailWalls(false, true));
++	}
++
+ 	@Test
+ 	void stepWithoutEdgeCrossingJoinsHalfway() {
+ 		double[][] p = poly(new double[] {0.1, 64, 0.5, 0.7, 64.5, 0.5}, null);

@@ -1,0 +1,393 @@
+armacraft perf patch 0002 -- UNAPPLIED. Render memo + generation sweep (server-thread O(walls) -> O(changed)).
+
+Why: ArenaRenderer.render rebuilds every wall's piece specs every tick (WallLayout.pieces, key strings,
+WallLayout.transform, DyePalette.closest = 17 HSV conversions with trig per wall), rebuilds the rim
+specs every tick, and each EntitySet.sync runs Reconcile.diff, which copies both key sets into
+LinkedHashSets and builds add/keep/remove sets. Only head walls (one per alive cycle) and walls that
+got new holes actually change between ticks.
+
+What it does:
+- per reconciliation key (WallKeys), memoise the wall record + owner colour and the piece keys/specs
+  built from it; unchanged walls reuse the same spec instances;
+- colour -> dye name cached per packed RGB; rim specs built once per round (and on layout change);
+- EntitySet gets begin()/want()/end(): a generation sweep replaces Reconcile.diff, and want()
+  short-circuits on spec identity before calling equals(). sync(map) still works (wraps the three).
+  rekeyPrefix is kept as is.
+Output (entities, keys, update calls) is the same as before; a layout/config change drops the memo.
+
+Effect (measured with tools/bench/HostTickBench, a line-by-line mirror without Minecraft types, see
+docs/perf.md): per-tick server-thread time 0.64 -> 0.09 ms and allocation 475 -> 76 KB on the largest
+captured 32-AI frame; 6.4 -> 1.0 ms at 3000 walls, 27 -> 5.6 ms at 10000 (synthetic).
+Base: render/ArenaRenderer.java + render/EntitySet.java as of 2026-10-02 00:08 BST (with WallKeys).
+Checked: `git apply --check`; host main + test + gametest sources compile; the 60 host unit tests pass
+with 0001+0002+0004 applied (scratch copy, JUnit launcher); the bench mirror of this pipeline ends
+each tick with the same number of tracked wall entities as the current one. Not run in a server.
+Apply from the repo root:  git apply docs/perf-patches/0002-host-render-memo.patch
+
+--- a/host/src/main/java/gl/syn/armacraft/render/EntitySet.java
++++ b/host/src/main/java/gl/syn/armacraft/render/EntitySet.java
+@@ -1,6 +1,5 @@
+ package gl.syn.armacraft.render;
+ 
+-import gl.syn.armacraft.logic.Reconcile;
+ import net.minecraft.core.BlockPos;
+ import net.minecraft.server.level.ServerLevel;
+ import net.minecraft.world.entity.Display;
+@@ -8,10 +7,15 @@
+ import org.jspecify.annotations.Nullable;
+ 
+ import java.util.HashMap;
++import java.util.Iterator;
+ import java.util.Map;
+ 
+ /**
+- * Display entities keyed by protocol id, reconciled against a desired map every tick.
++ * Display entities keyed by protocol id, reconciled against the desired specs every tick.
++ *
++ * <p>Per tick: {@link #begin}, then {@link #want} for every desired key, then {@link #end}, which discards
++ * every tracked entity that was not wanted this tick (a generation sweep: no per-tick key-set copies).
++ * {@link #sync} wraps the three for callers that already have a map.
+  *
+  * <p>Entities whose chunk is not loaded are simply not created (and retried next tick). Entities removed
+  * by the world (chunk unload; they are never saved, see EntityMixin) are recreated when their chunk is
+@@ -24,15 +28,19 @@
+ 	private static final class Tracked {
+ 		final Display entity;
+ 		Specs spec;
++		int gen;
+ 
+-		Tracked(Display entity, Specs spec) {
++		Tracked(Display entity, Specs spec, int gen) {
+ 			this.entity = entity;
+ 			this.spec = spec;
++			this.gen = gen;
+ 		}
+ 	}
+ 
+ 	private final String kindTag;
+ 	private final Map<K, Tracked> tracked = new HashMap<>();
++	private int gen;
++	private @Nullable ServerLevel level;
+ 	/** Diagnostics: creations skipped because the chunk was not loaded / rejected by the level. */
+ 	private long skippedUnloaded;
+ 	private long addRejected;
+@@ -42,42 +50,64 @@
+ 	}
+ 
+ 	public void sync(ServerLevel level, Map<K, ? extends Specs> desired) {
+-		Reconcile.Diff<K> diff = Reconcile.diff(tracked.keySet(), desired.keySet());
+-		for (K k : diff.remove()) {
+-			Tracked t = tracked.remove(k);
+-			if (t != null) {
++		begin(level);
++		for (Map.Entry<K, ? extends Specs> e : desired.entrySet()) {
++			want(e.getKey(), e.getValue());
++		}
++		end();
++	}
++
++	/** Start a tick: everything not {@link #want wanted} before {@link #end} is discarded. */
++	public void begin(ServerLevel level) {
++		this.level = level;
++		gen++;
++	}
++
++	public void want(K key, Specs spec) {
++		ServerLevel level = this.level;
++		if (level == null) {
++			throw new IllegalStateException("want() outside begin()/end()");
++		}
++		Tracked t = tracked.get(key);
++		if (t != null && (t.entity.isRemoved() || t.entity.level() != level)) {
++			if (!t.entity.isRemoved()) {
+ 				t.entity.discard();
+ 			}
++			tracked.remove(key);
++			t = null;
+ 		}
+-		for (Map.Entry<K, ? extends Specs> e : desired.entrySet()) {
+-			K key = e.getKey();
+-			Specs spec = e.getValue();
+-			Tracked t = tracked.get(key);
+-			if (t != null && (t.entity.isRemoved() || t.entity.level() != level)) {
+-				if (!t.entity.isRemoved()) {
+-					t.entity.discard();
+-				}
+-				tracked.remove(key);
+-				t = null;
++		if (t == null) {
++			if (!canSpawnAt(level, spec.x(), spec.z())) {
++				skippedUnloaded++;
++				return;
+ 			}
+-			if (t == null) {
+-				if (!canSpawnAt(level, spec.x(), spec.z())) {
+-					skippedUnloaded++;
+-					continue;
+-				}
+-				Display d = spec.create(level);
+-				d.addTag(TAG);
+-				d.addTag(kindTag);
+-				if (level.addFreshEntity(d)) {
+-					tracked.put(key, new Tracked(d, spec));
+-				} else {
+-					addRejected++;
+-				}
+-			} else if (!t.spec.equals(spec)) {
+-				spec.update(t.entity, t.spec);
+-				t.spec = spec;
++			Display d = spec.create(level);
++			d.addTag(TAG);
++			d.addTag(kindTag);
++			if (level.addFreshEntity(d)) {
++				tracked.put(key, new Tracked(d, spec, gen));
++			} else {
++				addRejected++;
++			}
++			return;
++		}
++		t.gen = gen;
++		// identity first: the renderer reuses spec instances for unchanged walls
++		if (t.spec != spec && !t.spec.equals(spec)) {
++			spec.update(t.entity, t.spec);
++			t.spec = spec;
++		}
++	}
++
++	public void end() {
++		for (Iterator<Tracked> it = tracked.values().iterator(); it.hasNext(); ) {
++			Tracked t = it.next();
++			if (t.gen != gen) {
++				t.entity.discard();
++				it.remove();
+ 			}
+ 		}
++		level = null;
+ 	}
+ 
+ 	public @Nullable Display get(K key) {
+@@ -114,19 +144,12 @@
+ 		}
+ 	}
+ 
+-	/** Tracked entities that are still in the world (chunk unloads remove them until re-spawned). */
+ 	public int size() {
+-		int n = 0;
+-		for (Tracked t : tracked.values()) {
+-			if (!t.entity.isRemoved()) {
+-				n++;
+-			}
+-		}
+-		return n;
++		return tracked.size();
+ 	}
+ 
+ 	public String diagnostics() {
+-		return kindTag + ": tracked=" + tracked.size() + " live=" + size() + " skippedUnloaded=" + skippedUnloaded + " addRejected=" + addRejected;
++		return kindTag + ": tracked=" + tracked.size() + " skippedUnloaded=" + skippedUnloaded + " addRejected=" + addRejected;
+ 	}
+ 
+ 	public void clear() {
+--- a/host/src/main/java/gl/syn/armacraft/render/ArenaRenderer.java
++++ b/host/src/main/java/gl/syn/armacraft/render/ArenaRenderer.java
+@@ -13,12 +13,21 @@
+ import net.minecraft.world.level.block.state.BlockState;
+ import org.jspecify.annotations.Nullable;
+ 
++import java.util.ArrayList;
+ import java.util.HashMap;
+ import java.util.LinkedHashMap;
+ import java.util.List;
+ import java.util.Map;
+ 
+-/** Turns protocol snapshots into display entities in one level. All methods run on the server thread. */
++/**
++ * Turns protocol snapshots into display entities in one level. All methods run on the server thread.
++ *
++ * <p>Per tick the work is O(walls) cheap comparisons plus O(changed) spec building: each player wall's
++ * piece specs are memoised per reconciliation key (see {@link WallKeys}) against the wall record they were
++ * built from (plus the owner colour), and reused as the same instances while the wall is unchanged, so
++ * {@link EntitySet#want} short-circuits on identity. Only head walls (and walls with new holes) rebuild.
++ * Rim specs are built once per round.
++ */
+ public final class ArenaRenderer {
+ 
+ 	public static final int RIM_RGB = 0xC0C0C0;
+@@ -28,50 +37,111 @@
+ 	private final EntitySet<String> walls = new EntitySet<>("wall");
+ 	private final EntitySet<String> rim = new EntitySet<>("rim");
+ 	private final Map<String, BlockState> blockCache = new HashMap<>();
++	/** packed 0xRRGGBB -> closest dye name (DyePalette.closest is ~17 trig-heavy conversions). */
++	private final Map<Integer, String> dyeByRgb = new HashMap<>();
+ 	/** Start points of each cycle's unnumbered (id 0) head wall in the previous snapshot. */
+ 	private Map<Long, double[]> prevHeads = Map.of();
+ 
++	/** Everything a wall spec depends on besides the wall itself; a change rebuilds all memos. */
++	private record Layout(ArenaMapping map, double wallHeight, double wallThickness, double maxPieceBlocks, String wallMaterial,
++		int interpTicks, float viewRange) {
++		static Layout of(ArenaMapping map, ArmaConfig cfg) {
++			return new Layout(map, cfg.wallHeight, cfg.wallThickness, cfg.maxPieceBlocks, cfg.wallMaterial, cfg.interpTicks, cfg.viewRange);
++		}
++	}
++
++	private static final class WallMemo {
++		Msg.Wall wall;
++		int rgb;
++		int gen;
++		final List<String> keys = new ArrayList<>(2);
++		final List<Specs.WallSpec> specs = new ArrayList<>(2);
++	}
++
++	private final Map<String, WallMemo> wallMemo = new HashMap<>();
++	private int memoGen;
++	private @Nullable Layout layout;
++	private Msg.@Nullable Round rimRound;
++	private final Map<String, Specs.WallSpec> rimCache = new LinkedHashMap<>();
++
+ 	public void render(ServerLevel level, ArenaMapping map, ArmaConfig cfg, Msg.@Nullable Round round, Msg.@Nullable State state) {
+-		rim.sync(level, rimSpecs(map, cfg, round));
+-		if (state == null) {
+-			cycles.sync(level, Map.of());
+-			names.sync(level, Map.of());
+-			walls.sync(level, Map.of());
+-			return;
+-		}
+-		Map<Long, Specs.CycleSpec> cycleSpecs = new LinkedHashMap<>();
+-		Map<Long, Specs.NameSpec> nameSpecs = new LinkedHashMap<>();
+-		Map<Long, Msg.Cycle> byId = new HashMap<>();
+-		for (Msg.Cycle c : state.cycles()) {
+-			byId.put(c.id(), c);
+-			if (!c.alive()) {
+-				continue;
++		Layout lay = Layout.of(map, cfg);
++		if (!lay.equals(layout)) {
++			layout = lay;
++			wallMemo.clear();
++			rimRound = null;
++		}
++		if (round != rimRound) {
++			rimRound = round;
++			rimCache.clear();
++			rimCache.putAll(rimSpecs(map, cfg, round));
++		}
++		rim.sync(level, rimCache);
++		cycles.begin(level);
++		names.begin(level);
++		walls.begin(level);
++		if (state != null) {
++			Map<Long, Msg.Cycle> byId = new HashMap<>(state.cycles().size() * 2);
++			for (Msg.Cycle c : state.cycles()) {
++				byId.put(c.id(), c);
++				if (!c.alive()) {
++					continue;
++				}
++				cycles.want(c.id(), cycleSpec(map, cfg, c));
++				if (cfg.nameTags && !c.name().isEmpty()) {
++					names.want(c.id(), new Specs.NameSpec(map.mcX(c.x()), map.mcY() + 1.6, map.mcZ(c.y()), c.name(),
++						DyePalette.packRgb(c.r(), c.g(), c.b()), cfg.interpTicks, cfg.viewRange));
++				}
+ 			}
+-			cycleSpecs.put(c.id(), cycleSpec(map, cfg, c));
+-			if (cfg.nameTags && !c.name().isEmpty()) {
+-				nameSpecs.put(c.id(), new Specs.NameSpec(map.mcX(c.x()), map.mcY() + 1.6, map.mcZ(c.y()), c.name(),
+-					DyePalette.packRgb(c.r(), c.g(), c.b()), cfg.interpTicks, cfg.viewRange));
++			WallKeys.Result keys = WallKeys.assign(state.walls(), prevHeads);
++			prevHeads = keys.heads();
++			keys.rekeys().forEach(walls::rekeyPrefix);
++			int gen = ++memoGen;
++			for (int wi = 0; wi < state.walls().size(); wi++) {
++				Msg.Wall w = state.walls().get(wi);
++				WallMemo m = wallMemo(map, cfg, keys.keys().get(wi), w, byId.get(w.cycle()));
++				m.gen = gen;
++				for (int i = 0; i < m.keys.size(); i++) {
++					walls.want(m.keys.get(i), m.specs.get(i));
++				}
+ 			}
+-		}
+-		Map<String, Specs.WallSpec> wallSpecs = new LinkedHashMap<>();
+-		WallKeys.Result keys = WallKeys.assign(state.walls(), prevHeads);
+-		prevHeads = keys.heads();
+-		keys.rekeys().forEach(walls::rekeyPrefix);
+-		for (int wi = 0; wi < state.walls().size(); wi++) {
+-			Msg.Wall w = state.walls().get(wi);
+-			Msg.Cycle owner = byId.get(w.cycle());
+-			double r = owner != null ? owner.r() : 1;
+-			double g = owner != null ? owner.g() : 1;
+-			double b = owner != null ? owner.b() : 1;
+-			BlockState block = dyeBlock(DyePalette.closest(r, g, b).name(), cfg.wallMaterial);
+-			int glow = DyePalette.packRgb(r, g, b);
+-			for (WallLayout.Piece p : WallLayout.pieces(keys.keys().get(wi), w.x1(), w.y1(), w.x2(), w.y2(), w.gaps(), cfg.maxPieceBlocks / map.scale())) {
+-				wallSpecs.put(p.key(), wallSpec(map, cfg, p, block, glow, cfg.wallHeight));
+-			}
+-		}
+-		cycles.sync(level, cycleSpecs);
+-		names.sync(level, nameSpecs);
+-		walls.sync(level, wallSpecs);
++			wallMemo.values().removeIf(m -> m.gen != gen);
++		} else {
++			wallMemo.clear();
++		}
++		cycles.end();
++		names.end();
++		walls.end();
++	}
++
++	/** The memo for this wall key, rebuilt only when the wall record or its owner colour changed. */
++	private WallMemo wallMemo(ArenaMapping map, ArmaConfig cfg, String key, Msg.Wall w, Msg.@Nullable Cycle owner) {
++		double r = owner != null ? owner.r() : 1;
++		double g = owner != null ? owner.g() : 1;
++		double b = owner != null ? owner.b() : 1;
++		int glow = DyePalette.packRgb(r, g, b);
++		WallMemo m = wallMemo.get(key);
++		if (m != null && m.rgb == glow && (m.wall == w || m.wall.equals(w))) {
++			return m;
++		}
++		if (m == null) {
++			m = new WallMemo();
++			wallMemo.put(key, m);
++		}
++		m.wall = w;
++		m.rgb = glow;
++		m.keys.clear();
++		m.specs.clear();
++		BlockState block = dyeBlock(dyeName(glow, r, g, b), cfg.wallMaterial);
++		for (WallLayout.Piece p : WallLayout.pieces(key, w.x1(), w.y1(), w.x2(), w.y2(), w.gaps(), cfg.maxPieceBlocks / map.scale())) {
++			m.keys.add(p.key());
++			m.specs.add(wallSpec(map, cfg, p, block, glow, cfg.wallHeight));
++		}
++		return m;
++	}
++
++	private String dyeName(int rgb, double r, double g, double b) {
++		return dyeByRgb.computeIfAbsent(rgb, k -> DyePalette.closest(r, g, b).name());
+ 	}
+ 
+ 	Map<String, Specs.WallSpec> rimSpecs(ArenaMapping map, ArmaConfig cfg, Msg.@Nullable Round round) {
+@@ -91,9 +161,10 @@
+ 	}
+ 
+ 	Specs.CycleSpec cycleSpec(ArenaMapping map, ArmaConfig cfg, Msg.Cycle c) {
+-		BlockState block = dyeBlock(DyePalette.closest(c.r(), c.g(), c.b()).name(), "concrete");
++		int rgb = DyePalette.packRgb(c.r(), c.g(), c.b());
++		BlockState block = dyeBlock(dyeName(rgb, c.r(), c.g(), c.b()), "concrete");
+ 		return new Specs.CycleSpec(map.mcX(c.x()), map.mcY(), map.mcZ(c.y()), ArenaMapping.yaw(c.dx(), c.dy()), block,
+-			DyePalette.packRgb(c.r(), c.g(), c.b()), cfg.interpTicks, cfg.viewRange);
++			rgb, cfg.interpTicks, cfg.viewRange);
+ 	}
+ 
+ 	static Specs.WallSpec wallSpec(ArenaMapping map, ArmaConfig cfg, WallLayout.Piece p, BlockState block, int glow, double height) {
+@@ -136,10 +207,13 @@
+ 	}
+ 
+ 	public void clear() {
+-		prevHeads = Map.of();
+ 		cycles.clear();
+ 		names.clear();
+ 		walls.clear();
+ 		rim.clear();
++		wallMemo.clear();
++		rimRound = null;
++		rimCache.clear();
++		prevHeads = Map.of();
+ 	}
+ }

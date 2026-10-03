@@ -1,0 +1,21 @@
+{
+	"required": true,
+	"package": "gl.syn.armacraft.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"mixins": [
+		"EntityMixin",
+		"PlayerMixin",
+		"PrimedTntMixin",
+		"ServerGamePacketListenerImplMixin",
+		"AvatarRideMixin",
+		"LivingEntityRideMixin",
+		"PlayerTravelMixin",
+		"EntityRideFxMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

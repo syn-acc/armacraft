@@ -1,0 +1,220 @@
+armacraft graphics patch 0001 -- UNAPPLIED. Assign armacraft_client's custom render pipelines to Iris shaderpack programs.
+
+Symptom (seen 2026-10-02, MC 26.3, Iris 1.11.7, Sodium 0.9.2, Complementary Unbound r5.9.3 + Euphoria Patches
+1.10.5 and Alpha Piscium 1.10.0): with any shaderpack on, the ride bike, trail walls, light pool (and the arena
+floor/rim/walls, same pipelines) explode into screen-filling garbage triangles. The log says, once per pipeline:
+  [Iris] Missing program armacraft_client:pipeline/arma_model in override list. This is not a critical problem,
+         but it could lead to weird rendering.   (also arma_wall, arma_additive; arma_solid_2s in arena mode)
+Screenshots: .work/play-shaders/run-client/screenshots/bench_cu2_*.png and bench_ap1_*.png.
+
+Cause: while a pack is active and the level is rendering, Iris swaps DefaultVertexFormat.ENTITY for its extended
+IrisVertexFormats.ENTITY (mc_Entity, mc_midTexCoord, at_tangent) in RenderPipeline.getVertexFormatBinding(s) and
+RenderType.format() (Iris MixinRenderPipeline, vertices/immediate/MixinRenderType), so our buffers are built with
+the larger stride. Pipelines it knows are redirected to a pack program whose vertex array is created for the
+extended format (MixinShaderManager_Overrides). Ours are unknown, so they keep the vanilla program and its original
+ENTITY attribute bindings: wrong stride, garbage positions. They would also miss the pack's TAA jitter.
+
+Fix: IrisApi.assignPipeline(RenderPipeline, IrisProgram) (Iris API v0.3+, present in 1.11.7) for MODEL, SOLID_2S,
+WALL and ADDITIVE at client init; a pipeline something else already assigned is logged and skipped, the rest go on. Iris is a compile-only dependency (Modrinth maven, exclusiveContent so nothing else
+resolves there); the Iris-typed code sits in a nested class that is only touched when Iris is loaded. OIT_WALL and
+OIT_ADDITIVE need nothing: Iris forces improved transparency off while a pack is active.
+render.iris_program in armacraft_client.json picks the programs (restart to change):
+  emissive (default)  all four -> gbuffers_spidereyes, the program vanilla's EYES pipeline (which ours are built
+                      from) goes to. Complementary/BSL-lineage packs draw it unlit and boosted, so the bike, walls and
+                      light pool glow and feed the pack's bloom.
+  lit                 bike, rim, walls -> gbuffers_entities (pack-lit, no glow); light pool/floor grid stay on
+                      spidereyes. For packs whose spidereyes is empty: Alpha Piscium 1.10.0 draws nothing there, so
+                      "emissive" would make the bike invisible. In "lit" AP draws the bike lit and the walls opaque
+                      (it forces blend off for gbuffers_entities), and draws no light pool.
+  off                 no assignment (the broken state; comparison only).
+Known pack limit (no patch): Noble 1.9.9 forces blending off for every gbuffers program, so the additive light pool
+is drawn opaque (black at its dim edge by day; reads as a glow at night). An alpha-weighted variant (SRC_ALPHA, ONE)
+was tried and made it opaque lavender instead, so it was dropped. With Noble, set ride.light=false for daytime.
+Not covered: the trail top edges and explosion rays use vanilla RenderTypes.linesTranslucent(), which Iris already
+maps to its LINES program; they rendered correctly in both packs once the garbage geometry was gone.
+Our geometry does not cast shadows under packs (it is submitted from LevelRenderEvents.COLLECT_SUBMITS, which the
+Iris shadow pass does not run). IrisApi.registerShadowRenderCallback (API v0.4) could add that later.
+
+Checked (2026-10-02):
+- git apply --check against client/ as of 13:45 BST: clean.
+- client jar task compiles with the patch (scratch copy, -Parmacraft.hostDir=.work/play-shaders). compileTestJava
+  fails identically with and without the patch (ArmaCamSettingsTest / ArmaChaseCameraReplayTest, client/ work in
+  progress at the time of the copy), so the tests were not run.
+- Behaviour verified in game through the equivalent shim in .work/play-shaders/src/iriscompat (same assignments,
+  done reflectively on the unmodified play jar), and once with this patch built into a jar
+  (.work/play-shaders/libs/armacraft-client-0.1.2-iris.jar, bench_cu3fix_*.png): bike, walls, light pool and HUD
+  render correctly under Complementary (emissive) and Alpha Piscium (lit). Arena mode (floor grid, rim walls) was
+  not run under shaders. The final revision (per-pipeline "already assigned" handling) was compiled, not re-run.
+Apply from the repo root:  git apply docs/graphics-patches/0001-client-iris-pipeline-programs.patch
+
+diff --git a/client/build.gradle b/client/build.gradle
+index 6a0f5fd..3b4296e 100644
+--- a/client/build.gradle
++++ b/client/build.gradle
+@@ -4,6 +4,18 @@ plugins {
+ 
+ repositories {
+ 	mavenCentral()
++	// Iris API (compile only, render/IrisCompat): Modrinth's maven, nothing else from there
++	exclusiveContent {
++		forRepository {
++			maven {
++				name = "Modrinth"
++				url = "https://api.modrinth.com/maven"
++			}
++		}
++		filter {
++			includeGroup "maven.modrinth"
++		}
++	}
+ }
+ 
+ // Not shipped: the client game test (src/gametest), configured below once loom has created the client source set.
+@@ -93,6 +105,8 @@ dependencies {
+ 	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+ 	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+ 	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
++	// optional: assigns ArmaRenderTypes pipelines to shaderpack programs when Iris is installed (render/IrisCompat)
++	clientCompileOnly "maven.modrinth:iris:${project.iris_version}"
+ 
+ 	testImplementation platform("org.junit:junit-bom:${project.junit_version}")
+ 	testImplementation "org.junit.jupiter:junit-jupiter"
+diff --git a/client/gradle.properties b/client/gradle.properties
+index f286b00..6d4bfa8 100644
+--- a/client/gradle.properties
++++ b/client/gradle.properties
+@@ -14,4 +14,6 @@ group=gl.syn.armacraft
+ 
+ # Dependencies
+ fabric_api_version=0.161.0+26.3
++# compile-only (render/IrisCompat); Modrinth version number, https://modrinth.com/mod/iris
++iris_version=1.11.7+26.3-fabric
+ junit_version=5.11.4
+diff --git a/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java b/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java
+index e47f465..b0876f3 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java
++++ b/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java
+@@ -9,6 +9,7 @@ import gl.syn.armacraft.client.net.RelayBinding;
+ import gl.syn.armacraft.client.net.RelayPresence;
+ import gl.syn.armacraft.client.render.ArenaRenderer;
+ import gl.syn.armacraft.client.render.ArmaRenderTypes;
++import gl.syn.armacraft.client.render.IrisCompat;
+ import gl.syn.armacraft.client.render.ArmaTextures;
+ import net.fabricmc.api.ClientModInitializer;
+ import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
+@@ -44,6 +45,7 @@ public final class ArmacraftClient implements ClientModInitializer {
+ 		ClientConfig cfg = ClientConfig.load(FabricLoader.getInstance().getConfigDir().resolve("armacraft_client.json"));
+ 		ArenaClient client = new ArenaClient(cfg);
+ 		ArmaRenderTypes.init();
++		IrisCompat.init(cfg.render.irisProgram);
+ 		ArmaKeys.init();
+ 		dev = new DevTools();
+ 		ArenaRenderer renderer = new ArenaRenderer(client);
+diff --git a/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java b/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java
+index e307946..bd5b7b7 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java
++++ b/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java
+@@ -90,6 +90,12 @@ public final class ClientConfig {
+ 		public boolean hideFallbackDisplays = true;
+ 		/** Line width (pixels) for wall top edges and explosion rays (GL default line width is 1). */
+ 		public double lineWidth = 2.0;
++		/**
++		 * Shaderpack program for the armacraft pipelines under Iris (restart to change): "emissive" (gbuffers_spidereyes:
++		 * glows, feeds bloom; Complementary, BSL and most OptiFine-lineage packs), "lit" (bike and walls through
++		 * gbuffers_entities: for packs that draw nothing in spidereyes, e.g. Alpha Piscium), "off" (unassigned: broken geometry).
++		 */
++		public String irisProgram = "emissive";
+ 	}
+ 
+ 	public static final class Sound {
+diff --git a/pb/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java b/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java
+new file mode 100644
+index 0000000..b90f73b
+--- /dev/null
++++ b/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java
+@@ -0,0 +1,85 @@
++package gl.syn.armacraft.client.render;
++
++import net.fabricmc.loader.api.FabricLoader;
++import net.irisshaders.iris.api.v0.IrisApi;
++import net.irisshaders.iris.api.v0.IrisProgram;
++import com.mojang.renderpearl.api.pipeline.RenderPipeline;
++import org.slf4j.Logger;
++import org.slf4j.LoggerFactory;
++
++import java.util.Locale;
++
++/**
++ * Iris (shaderpack) support for the custom pipelines in {@link ArmaRenderTypes}.
++ *
++ * <p>Why: with a shaderpack active, Iris swaps the vertex format of every {@code ENTITY}-format pipeline to its
++ * extended format (mc_Entity, mc_midTexCoord, at_tangent) and redirects each known pipeline to a pack program.
++ * A pipeline it does not know ("Missing program armacraft_client:pipeline/... in override list") keeps the vanilla
++ * shader and its original attribute layout, so it reads the extended buffer with the wrong stride: bike, trail
++ * walls, light pool and arena floor turn into screen-filling garbage triangles, and they also miss the pack's TAA
++ * jitter. Assigning the pipelines to a pack program through the Iris API fixes both.
++ *
++ * <p>{@code render.iris_program} in armacraft_client.json picks the program (restart to change):
++ * <ul>
++ *   <li>{@code emissive} (default): {@code gbuffers_spidereyes}, the program packs use for glowing entity parts
++ *       (vanilla's EYES pipeline, which ours are built from, goes there too). Unlit and boosted in OptiFine-lineage
++ *       packs (Complementary, BSL, ...), so bike, trails and light pool glow and feed the pack's bloom. Some packs
++ *       stub spidereyes out (Alpha Piscium 1.10 draws nothing there): use {@code lit} with those.</li>
++ *   <li>{@code lit}: bike, rim and trail walls through {@code gbuffers_entities} (pack-lit like a mob: sun shading,
++ *       specular; no glow); floor grid and light pool stay on spidereyes (not drawn where a pack stubs it out).</li>
++ *   <li>{@code off}: leave the pipelines unassigned (the broken state above; for comparison only).</li>
++ * </ul>
++ * Only loaded when Iris is present; Iris is a compile-only dependency.
++ */
++public final class IrisCompat {
++
++	private static final Logger LOG = LoggerFactory.getLogger("armacraft_client/iris");
++
++	private IrisCompat() {
++	}
++
++	/** Call once at client init, after {@link ArmaRenderTypes#init()}. */
++	public static void init(String mode) {
++		if (!FabricLoader.getInstance().isModLoaded("iris")) {
++			return;
++		}
++		String m = mode == null ? "emissive" : mode.toLowerCase(Locale.ROOT);
++		if ("off".equals(m)) {
++			LOG.info("iris_program=off: armacraft pipelines left unassigned");
++			return;
++		}
++		try {
++			Assign.run("lit".equals(m));
++		} catch (Throwable t) {
++			// older Iris without assignPipeline (API < 0.3)
++			LOG.warn("could not assign armacraft pipelines to Iris programs: {}", t.toString());
++		}
++	}
++
++	/** Separate class so nothing Iris-typed is resolved unless Iris is loaded. */
++	private static final class Assign {
++		static void run(boolean lit) {
++			IrisApi api = IrisApi.getInstance();
++			IrisProgram solid = lit ? IrisProgram.ENTITIES : IrisProgram.EMISSIVE_ENTITIES;
++			IrisProgram wall = lit ? IrisProgram.ENTITIES : IrisProgram.EMISSIVE_ENTITIES;
++			// light pool and floor grid stay emissive in both modes: through gbuffers_textured Alpha Piscium drew them as
++			// opaque white quads; through its (empty) spidereyes they are simply not drawn, which is the right fallback
++			IrisProgram additive = IrisProgram.EMISSIVE_ENTITIES;
++			assign(api, ArmaRenderTypes.MODEL, solid);
++			assign(api, ArmaRenderTypes.SOLID_2S, solid);
++			assign(api, ArmaRenderTypes.WALL, wall);
++			assign(api, ArmaRenderTypes.ADDITIVE, additive);
++			// OIT_WALL / OIT_ADDITIVE are not needed: Iris turns improved transparency off while a pack is active.
++		}
++
++		private static void assign(IrisApi api, RenderPipeline pipeline, IrisProgram program) {
++			try {
++				api.assignPipeline(pipeline, program);
++				LOG.info("Iris: {} -> {}", pipeline.getLocation(), program);
++			} catch (IllegalStateException e) {
++				// already assigned (by another mod or an earlier init): keep that one, carry on with the rest
++				LOG.info("Iris: {} already assigned ({})", pipeline.getLocation(), e.getMessage());
++			}
++		}
++	}
++}

@@ -1,0 +1,35 @@
+{
+	"schemaVersion": 1,
+	"id": "armacraft",
+	"version": "${version}",
+	"name": "armacraft",
+	"description": "Server-side bridge that renders an Armagetron Advanced arena in Minecraft with display entities and feeds player input back. Ride mode: drive a light cycle through a regular world (needs the mod on the client).",
+	"authors": [
+		"syn"
+	],
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"gl.syn.armacraft.Armacraft", "gl.syn.armacraft.relay.BridgeRelay",
+			"gl.syn.armacraft.ride.server.RideServerInit"
+		],
+		"client": [
+			"gl.syn.armacraft.client.ride.RideClientMod"
+		]
+	},
+	"mixins": [
+		"armacraft.mixins.json",
+		"armacraft-ride-server.mixins.json",
+		{
+			"config": "armacraft.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*"
+	}
+}

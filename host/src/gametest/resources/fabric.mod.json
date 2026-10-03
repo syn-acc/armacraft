@@ -1,0 +1,27 @@
+{
+	"schemaVersion": 1,
+	"id": "armacraft-gametest",
+	"version": "${version}",
+	"name": "armacraft game tests",
+	"description": "Headless in-world tests for armacraft (Fabric GameTest). Not shipped.",
+	"license": "MIT",
+	"environment": "*",
+	"entrypoints": {
+		"fabric-gametest": [
+			"gl.syn.armacraft.gametest.ArmacraftGameTests",
+			"gl.syn.armacraft.ride.server.RideServerGameTests",
+			"gl.syn.armacraft.gametest.RideMultiplayerGameTests"
+		],
+		"fabric-client-gametest": [
+			"gl.syn.armacraft.gametest.ArmacraftClientGameTest",
+			"gl.syn.armacraft.gametest.RideClientGameTest"
+		]
+	},
+	"mixins": [
+		"armacraft-gametest.mixins.json"
+	],
+	"depends": {
+		"armacraft": "*",
+		"fabric-gametest-api-v1": "*"
+	}
+}

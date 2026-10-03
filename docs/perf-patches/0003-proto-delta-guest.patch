@@ -1,0 +1,390 @@
+armacraft perf patch 0003 -- UNAPPLIED. Protocol feature `delta` (guest side) + PROTOCOL.md.
+
+Why: every `state` re-sends every wall at 30 Hz. In measured AI rounds only ~8% of walls change per
+frame (head walls + new holes), and cycles are ~20% of the bytes.
+
+What it does (opt-in, v1 stays the default):
+- guest hello advertises "features":["delta"]; a host that sends {"type":"hello","features":["delta"]}
+  gets `delta` lines instead of `state`: all cycles, only walls that are new/changed since what *this
+  host* was last sent, and `removed` ids. key:true on opt-in and at every round start. A later host
+  hello replaces the feature set ("features":[] switches back to `state`).
+- diffing is against the per-host "last sent" map (exact REAL compare, no formatting for unchanged
+  walls), so a delta skipped for a slow host (backlog) is folded into the next one.
+- a head wall has no net id yet (id 0 in `state`, one per alive cycle); deltas carry it as -cycle.
+- the frame (cycles + visible walls) is built once per emission and shared by all hosts; `state`
+  output is produced by the same formatting code as before (byte layout unchanged), and is now only
+  built when some host actually takes it.
+Hosts that never send a hello, and the v1 host in host/, see no difference.
+
+Checked: built (docker build of guest/ + this patch, tag armacraft-guest:perf-delta, g++ -std=c++11,
+no warnings in gBridge.cpp); `tools/bench_guest.py deltacheck` (one v1 and one delta connection to
+the same guest, frames matched by `t`): folded deltas == v1 state walls on 3567/3567 frames incl. a
+round change (8 AIs) with this exact patch, and on 2698 (32 AIs) + 4444 (8 AIs) frames with the
+previous revision (same diff logic, hello could not switch back); deltas were 24-26% of the v1 bytes. Interleaved CPU A/B on one 32-AI round (~270 walls, 4 windows each): snapshot
+cost 0.90 ms (v1 state) vs 0.36 ms (delta) of guest CPU per snapshot.
+Base: guest/src/gBridge.cpp as of 2026-10-02 00:39 BST, PROTOCOL.md as of 2026-10-01 22:50. The tree
+that was built and measured differed from this base only in one log string ("bridge: listening on").
+Apply from the repo root:  git apply docs/perf-patches/0003-proto-delta-guest.patch
+
+--- a/guest/src/gBridge.cpp
++++ b/guest/src/gBridge.cpp
+@@ -479,6 +479,17 @@
+ // connections and bridge players
+ // ****************************************************************************
+ 
++// what a delta host was last sent for one wall (exact values; only changed walls get formatted)
++struct gWallSent
++{
++    int cycle;
++    REAL x1, y1, x2, y2;
++    std::vector< std::pair< REAL, REAL > > gaps;
++    bool seen; // present in the frame being built
++
++    gWallSent(): cycle( -1 ), x1( 0 ), y1( 0 ), x2( 0 ), y2( 0 ), seen( false ) {}
++};
++
+ struct gBridgeConnection
+ {
+     int id;
+@@ -490,8 +501,13 @@
+     bool needRound;   // send `round` as soon as one is running
+     int roundSeen;    // number of the last `round` this host received
+     std::string why;  // reason for disconnecting
+-
+-    gBridgeConnection(): id( 0 ), fd( -1 ), dead( false ), needRound( true ), roundSeen( 0 ) {}
++    bool delta;       // host opted in to `delta` messages (its hello listed features:["delta"])
++    bool deltaKey;    // the next delta is a keyframe (opt-in, round start)
++    unsigned long deltaSeq;
++    std::map< int, gWallSent > sent; // delta wall id (net id, or -cycle for a head wall without one) -> last sent
++
++    gBridgeConnection(): id( 0 ), fd( -1 ), dead( false ), needRound( true ), roundSeen( 0 ),
++                         delta( false ), deltaKey( true ), deltaSeq( 0 ) {}
+ };
+ 
+ struct gBridgePlayer
+@@ -1232,17 +1248,58 @@
+ 
+ static double sg_lastStateTime = -1E30;
+ 
+-static std::string sg_BuildStateJson( eGrid * grid )
++// one visible player wall of the frame being emitted
++struct gFrameWall
++{
++    int id, cycle;
++    eCoord a, b;
++    std::vector< std::pair< REAL, REAL > > gaps;
++};
++
++// everything a `state` or `delta` line needs, computed once per emission for all hosts
++struct gFrame
++{
++    REAL t;
++    std::string cycles; // body of the "cycles" array (always sent in full)
++    std::vector< gFrameWall > walls;
++};
++
++static void sg_AppendWall( std::string & line, gFrameWall const & w, int id )
++{
++    line += "{\"id\":"; sg_JsonInt( line, id );
++    line += ",\"cycle\":"; sg_JsonInt( line, w.cycle );
++    line += ",\"x1\":"; sg_JsonNum( line, w.a.x );
++    line += ",\"y1\":"; sg_JsonNum( line, w.a.y );
++    line += ",\"x2\":"; sg_JsonNum( line, w.b.x );
++    line += ",\"y2\":"; sg_JsonNum( line, w.b.y );
++    if ( !w.gaps.empty() )
++    {
++        line += ",\"gaps\":[";
++        for ( size_t g = 0; g < w.gaps.size(); ++g )
++        {
++            if ( g ) line += ',';
++            line += '[';
++            sg_JsonNum( line, w.gaps[g].first );
++            line += ',';
++            sg_JsonNum( line, w.gaps[g].second );
++            line += ']';
++        }
++        line += ']';
++    }
++    line += '}';
++}
++
++static void sg_BuildFrame( eGrid * grid, gFrame & frame )
+ {
+     REAL t = se_GameTime();
++    frame.t = t;
++    frame.walls.clear();
+     std::vector< gCycle * > cycles;
+     sg_CollectCycles( grid, cycles );
+ 
+-    std::string line;
+-    line.reserve( 4096 );
+-    line = "{\"type\":\"state\",\"t\":";
+-    sg_JsonNum( line, t );
+-    line += ",\"cycles\":[";
++    std::string & line = frame.cycles;
++    line.clear();
++    line.reserve( 256 * ( cycles.size() + 1 ) );
+ 
+     tList< gNetPlayerWall > * lists[2] = { &sg_netPlayerWalls, &sg_netPlayerWallsGridded };
+ 
+@@ -1309,9 +1366,6 @@
+         line += "}";
+     }
+ 
+-    line += "],\"walls\":[";
+-
+-    bool first = true;
+     std::vector< std::pair< REAL, REAL > > gaps;
+     for ( int l = 0; l < 2; ++l )
+     {
+@@ -1331,48 +1385,130 @@
+             if ( ( b - a ).Norm() < 1E-3 )
+                 continue;
+ 
+-            if ( !first ) line += ',';
+-            first = false;
+-            line += "{\"id\":"; sg_JsonInt( line, w->ID() );
+-            line += ",\"cycle\":"; sg_JsonInt( line, w->Cycle()->ID() );
+-            line += ",\"x1\":"; sg_JsonNum( line, a.x );
+-            line += ",\"y1\":"; sg_JsonNum( line, a.y );
+-            line += ",\"x2\":"; sg_JsonNum( line, b.x );
+-            line += ",\"y2\":"; sg_JsonNum( line, b.y );
+-            if ( !gaps.empty() )
+-            {
+-                line += ",\"gaps\":[";
+-                for ( size_t g = 0; g < gaps.size(); ++g )
+-                {
+-                    if ( g ) line += ',';
+-                    line += '[';
+-                    sg_JsonNum( line, gaps[g].first );
+-                    line += ',';
+-                    sg_JsonNum( line, gaps[g].second );
+-                    line += ']';
+-                }
+-                line += ']';
+-            }
+-            line += '}';
+-        }
++            frame.walls.push_back( gFrameWall() );
++            gFrameWall & fw = frame.walls.back();
++            fw.id = w->ID();
++            fw.cycle = wc->ID();
++            fw.a = a;
++            fw.b = b;
++            fw.gaps = gaps;
++        }
++    }
++}
++
++// v1 `state`: every wall, byte-identical to the pre-delta output
++static std::string sg_FullStateJson( gFrame const & f )
++{
++    std::string line;
++    line.reserve( 64 + f.cycles.size() + 96 * f.walls.size() );
++    line = "{\"type\":\"state\",\"t\":";
++    sg_JsonNum( line, f.t );
++    line += ",\"cycles\":[";
++    line += f.cycles;
++    line += "],\"walls\":[";
++    for ( size_t i = 0; i < f.walls.size(); ++i )
++    {
++        if ( i ) line += ',';
++        sg_AppendWall( line, f.walls[i], f.walls[i].id );
+     }
+     line += "]}";
+     return line;
+ }
+ 
++// `delta` (opt-in): all cycles, only walls that are new or changed since what *this* host was last
++// sent, and the ids that disappeared. Diffing against the per-host "last sent" map (not the previous
++// frame) keeps skipped frames (slow host backlog) lossless.
++static std::string sg_DeltaJson( gBridgeConnection & c, gFrame const & f )
++{
++    bool key = c.deltaKey;
++    c.deltaKey = false;
++    if ( key )
++        c.sent.clear();
++
++    std::string line;
++    line.reserve( 128 + f.cycles.size() + 512 );
++    line = "{\"type\":\"delta\",\"seq\":";
++    sg_JsonInt( line, long( ++c.deltaSeq ) );
++    line += ",\"key\":";
++    line += key ? "true" : "false";
++    line += ",\"t\":";
++    sg_JsonNum( line, f.t );
++    line += ",\"cycles\":[";
++    line += f.cycles;
++    line += "],\"walls\":[";
++
++    for ( std::map< int, gWallSent >::iterator it = c.sent.begin(); it != c.sent.end(); ++it )
++        it->second.seen = false;
++
++    bool first = true;
++    for ( size_t i = 0; i < f.walls.size(); ++i )
++    {
++        gFrameWall const & w = f.walls[i];
++        // a cycle's current head wall has no net id yet (id 0 in `state`, one per alive cycle);
++        // deltas need a stable key, so it travels as -cycle until it gets its real id
++        int id = w.id > 0 ? w.id : -w.cycle;
++        std::map< int, gWallSent >::iterator it = c.sent.find( id );
++        bool changed = it == c.sent.end();
++        if ( changed )
++            it = c.sent.insert( std::make_pair( id, gWallSent() ) ).first;
++        gWallSent & s = it->second;
++        s.seen = true;
++        if ( !changed && s.cycle == w.cycle && s.x1 == w.a.x && s.y1 == w.a.y && s.x2 == w.b.x && s.y2 == w.b.y && s.gaps == w.gaps )
++            continue;
++        s.cycle = w.cycle;
++        s.x1 = w.a.x; s.y1 = w.a.y; s.x2 = w.b.x; s.y2 = w.b.y;
++        s.gaps = w.gaps;
++        if ( !first ) line += ',';
++        first = false;
++        sg_AppendWall( line, w, id );
++    }
++
++    line += "],\"removed\":[";
++    first = true;
++    for ( std::map< int, gWallSent >::iterator it = c.sent.begin(); it != c.sent.end(); )
++    {
++        if ( it->second.seen )
++        {
++            ++it;
++            continue;
++        }
++        if ( !first ) line += ',';
++        first = false;
++        sg_JsonInt( line, it->first );
++        c.sent.erase( it++ );
++    }
++    line += "]}";
++    return line;
++}
++
+ static void sg_EmitState( eGrid * grid )
+ {
+     std::vector< gBridgeConnection * > & conns = sg_Connections();
+     if ( conns.empty() || !grid )
+         return;
+-    std::string line = sg_BuildStateJson( grid );
++    gFrame frame;
++    bool built = false;
++    std::string full;
+     for ( size_t i = 0; i < conns.size(); ++i )
+     {
+         gBridgeConnection & c = *conns[i];
+-        // full snapshots: skipping one for a host that lags behind loses nothing
++        // full snapshots: skipping one for a host that lags behind loses nothing; deltas diff against
++        // what the host was last sent, so a skipped delta is folded into the next one
+         if ( c.out.size() > sg_stateSkipBacklog || c.needRound )
+             continue;
+-        sg_Send( c, line );
++        if ( !built )
++        {
++            sg_BuildFrame( grid, frame );
++            built = true;
++        }
++        if ( c.delta )
++            sg_Send( c, sg_DeltaJson( c, frame ) );
++        else
++        {
++            if ( full.empty() )
++                full = sg_FullStateJson( frame );
++            sg_Send( c, full );
++        }
+     }
+ }
+ 
+@@ -1386,8 +1522,28 @@
+     sg_JsonStr( line, (char const *)sn_programVersion );
+     line += ",\"rate\":";
+     sg_JsonNum( line, sg_bridgeRate );
+-    line += "}";
++    line += ",\"features\":[\"delta\"]}";
+     sg_Send( c, line );
++}
++
++// host -> guest `hello` (optional): {"type":"hello","proto":1,"features":["delta"]}
++// `features` is the full set the host wants; a later hello replaces it ([] = back to plain v1).
++static void sg_HandleHello( gBridgeConnection & c, gJson const & msg )
++{
++    gJson const * f = msg.Get( "features" );
++    if ( !f || f->type != gJson::Array )
++        return;
++    bool delta = false;
++    for ( size_t i = 0; i < f->arr.size(); ++i )
++        if ( f->arr[i].IsString() && f->arr[i].str == "delta" )
++            delta = true;
++    if ( delta != c.delta )
++    {
++        c.delta = delta;
++        c.deltaKey = true;
++        c.sent.clear();
++        con << "bridge: host #" << c.id << ( delta ? " uses delta snapshots\n" : " uses full snapshots\n" );
++    }
+ }
+ 
+ static bool sg_GetString( gJson const & msg, char const * key, std::string & out )
+@@ -1706,7 +1862,9 @@
+         return;
+     }
+ 
+-    if ( type == "join" )
++    if ( type == "hello" )
++        sg_HandleHello( c, msg );
++    else if ( type == "join" )
+         sg_HandleJoin( c, msg );
+     else if ( type == "leave" )
+         sg_HandleLeave( c, msg );
+@@ -1845,6 +2003,7 @@
+         sg_Send( *conns[i], sg_roundJson );
+         conns[i]->needRound = false;
+         conns[i]->roundSeen = sg_roundNumber;
++        conns[i]->deltaKey = true; // first delta of a round replaces the host's wall set
+     }
+ 
+     sg_Track( sg_roundGrid );
+--- a/PROTOCOL.md
++++ b/PROTOCOL.md
+@@ -21,8 +21,10 @@
+ 
+ ### `hello` (once, on connect)
+ ```json
+-{"type":"hello","proto":1,"game":"armagetronad","version":"0.2.9.3.0","rate":30}
++{"type":"hello","proto":1,"game":"armagetronad","version":"0.2.9.3.0","rate":30,"features":["delta"]}
+ ```
++- `features` (optional): optional protocol features this guest can provide. A host turns one on by
++  sending its own `hello` (see Host → guest). Hosts that never ask keep getting plain v1 messages.
+ 
+ ### `round` (on connect if a round is running, and at every round start)
+ Static geometry: arena rim + any static map walls, as line segments.
+@@ -46,6 +48,21 @@
+ - `walls[].gaps` (optional): list of `[from,to]` fractions (0..1 along the wall) that are holes (explosions etc). Omit when none.
+ - Dead cycles may stay in `cycles` with `"alive":false` while their walls persist.
+ 
++### `delta` (feature `delta`, only after the host asked for it; replaces `state` for that host)
++```json
++{"type":"delta","seq":812,"key":false,"t":12.37,
++ "cycles":[ ...same as state... ],
++ "walls":[{"id":905,"cycle":17,"x1":0,"y1":40,"x2":12.5,"y2":40}],
++ "removed":[880,881]}
++```
++- `cycles` is complete, exactly as in `state`.
++- `walls` lists only walls that are new or whose fields changed since the last `delta` this host
++  received; `removed` lists wall ids that are gone. Apply in order: if `key`, clear the wall set; drop
++  `removed`; upsert `walls`. The result equals what a `state` for that frame would have listed.
++- `key:true` on the first delta after the host's request and on the first delta of every round.
++- The guest diffs against what it last *sent* to this host, so a delta it skips for a slow host is
++  folded into the next one. `seq` increases by one per delta (diagnostics; gaps are not an error).
++
+ ### `event`
+ ```json
+ {"type":"event","ev":"spawn","id":17,"x":0,"y":0,"t":0.0}
+@@ -65,6 +82,7 @@
+ ## Host → guest
+ 
+ ```json
++{"type":"hello","proto":1,"features":["delta"]}      // optional; the features the host wants (a later hello replaces the set, [] = plain v1)
+ {"type":"join","key":"mc:<uuid>","name":"Jamie","color":[0.1,0.6,1.0]}
+ {"type":"leave","key":"mc:<uuid>"}
+ {"type":"input","key":"mc:<uuid>","turn":"left"}     // or "right"; one message per key press

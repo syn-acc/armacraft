@@ -1,0 +1,18 @@
+{
+	"required": true,
+	"package": "gl.syn.armacraft.client.ride.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"CameraRideMixin",
+		"ClientInputAccessor",
+		"KeyboardInputRideMixin",
+		"EntityRenderDispatcherRideMixin",
+		"KeyboardHandlerRideMixin",
+		"MouseHandlerRideMixin",
+		"MinecraftRideMixin",
+		"GameRendererRideMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

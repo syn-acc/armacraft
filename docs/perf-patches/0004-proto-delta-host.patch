@@ -1,0 +1,185 @@
+armacraft perf patch 0004 -- UNAPPLIED. Protocol feature `delta` (host side). Pairs with 0003.
+
+What it does:
+- Msg.Hello gets `features` (4-arg constructor kept); Msg.Delta; Protocol parses "delta" (same
+  cycles/walls shape as state, plus seq/key/removed) and builds the host hello.
+- BridgeClient: if the guest's hello offers "delta" (and -Darmacraft.delta is not false), send the host
+  hello; fold each delta into a per-connection wall map on the bridge thread and publish a full
+  Msg.State as before. The server thread is unchanged. Unchanged walls keep their record instances
+  across snapshots, so 0002's memo hits on identity.
+- Old guests never offer the feature -> nothing changes.
+
+Effect: bridge-thread parse work becomes O(changed) (see docs/perf.md: Gson parse of a delta frame vs
+a full frame). Bandwidth -74..76% (measured with 0003).
+Checked: `git apply --check`; host main + test + gametest sources compile; host unit tests pass with
+0002+0004 applied in a scratch copy; a scratch check fed delta lines through BridgeClient.handleLine
+(keyframe, in-place head update, record identity kept, removed ids, keyframe replace, v1 state still
+accepted). Not run against the patched guest end-to-end inside Minecraft.
+Base: bridge/Msg.java, bridge/Protocol.java, bridge/BridgeClient.java as of 2026-10-02 00:01 BST.
+Apply from the repo root:  git apply docs/perf-patches/0004-proto-delta-host.patch
+
+--- a/host/src/main/java/gl/syn/armacraft/bridge/Msg.java
++++ b/host/src/main/java/gl/syn/armacraft/bridge/Msg.java
+@@ -9,7 +9,12 @@
+ /** Guest to host messages (PROTOCOL.md), plus two synthetic connection markers produced by the client. */
+ public sealed interface Msg {
+ 
+-	record Hello(int proto, String game, String version, double rate) implements Msg {}
++	/** features: optional protocol features the guest offers (e.g. "delta"); empty for older guests. */
++	record Hello(int proto, String game, String version, double rate, List<String> features) implements Msg {
++		public Hello(int proto, String game, String version, double rate) {
++			this(proto, game, version, rate, List.of());
++		}
++	}
+ 
+ 	record Seg(double x1, double y1, double x2, double y2) {}
+ 
+@@ -26,6 +31,13 @@
+ 
+ 	/** receivedNanos is the host's System.nanoTime() at parse time (used for extrapolation). */
+ 	record State(double t, List<Cycle> cycles, List<Wall> walls, long receivedNanos) implements Msg {}
++
++	/**
++	 * Opt-in delta snapshot (PROTOCOL.md "delta" feature): all cycles, only walls that are new or changed,
++	 * ids of walls that are gone. key=true replaces the whole wall set. BridgeClient folds these into a
++	 * full {@link State}, so the server thread never sees a Delta.
++	 */
++	record Delta(long seq, boolean key, double t, List<Cycle> cycles, List<Wall> walls, long[] removed, long receivedNanos) implements Msg {}
+ 
+ 	/** Generic event; the raw object is kept so unknown events and extra fields survive. */
+ 	record Event(String ev, JsonObject raw, long receivedNanos) implements Msg {
+--- a/host/src/main/java/gl/syn/armacraft/bridge/Protocol.java
++++ b/host/src/main/java/gl/syn/armacraft/bridge/Protocol.java
+@@ -48,9 +48,11 @@
+ 		JsonObject o = el.getAsJsonObject();
+ 		String type = getString(o, "type", "");
+ 		return switch (type) {
+-			case "hello" -> new Msg.Hello((int) getLong(o, "proto", VERSION), getString(o, "game", ""), getString(o, "version", ""), getDouble(o, "rate", 0));
++			case "hello" -> new Msg.Hello((int) getLong(o, "proto", VERSION), getString(o, "game", ""), getString(o, "version", ""), getDouble(o, "rate", 0),
++				strings(o.get("features")));
+ 			case "round" -> parseRound(o);
+ 			case "state" -> parseState(o, nowNanos);
++			case "delta" -> parseDelta(o, nowNanos);
+ 			case "event" -> new Msg.Event(getString(o, "ev", ""), o, nowNanos);
+ 			case "joined" -> new Msg.Joined(getString(o, "key", ""), getString(o, "name", ""));
+ 			case "left" -> new Msg.Left(getString(o, "key", ""));
+@@ -140,7 +142,49 @@
+ 		return new Msg.State(getDouble(o, "t", 0), cycles, walls, nowNanos);
+ 	}
+ 
++	/** Same cycles/walls shape as a state; plus seq, key and removed wall ids. */
++	static Msg.Delta parseDelta(JsonObject o, long nowNanos) {
++		Msg.State body = parseState(o, nowNanos);
++		JsonArray ra = getArray(o, "removed");
++		long[] removed = new long[ra == null ? 0 : ra.size()];
++		int n = 0;
++		if (ra != null) {
++			for (JsonElement e : ra) {
++				if (isNumber(e)) {
++					removed[n++] = e.getAsLong();
++				}
++			}
++		}
++		return new Msg.Delta(getLong(o, "seq", 0), getBool(o, "key", false), body.t(), body.cycles(), body.walls(),
++			n == removed.length ? removed : java.util.Arrays.copyOf(removed, n), nowNanos);
++	}
++
++	static List<String> strings(@Nullable JsonElement e) {
++		if (e == null || !e.isJsonArray()) {
++			return List.of();
++		}
++		List<String> out = new ArrayList<>();
++		for (JsonElement x : e.getAsJsonArray()) {
++			if (x.isJsonPrimitive() && x.getAsJsonPrimitive().isString()) {
++				out.add(x.getAsString());
++			}
++		}
++		return List.copyOf(out);
++	}
++
+ 	// ---- host -> guest builders ----
++
++	/** Host hello: asks the guest for optional features it offered in its own hello. Older guests ignore it. */
++	public static JsonObject hello(List<String> features) {
++		JsonObject o = typed("hello");
++		o.addProperty("proto", VERSION);
++		JsonArray a = new JsonArray();
++		for (String f : features) {
++			a.add(f);
++		}
++		o.add("features", a);
++		return o;
++	}
+ 
+ 	public static JsonObject join(String key, String name, double[] color) {
+ 		JsonObject o = typed("join");
+--- a/host/src/main/java/gl/syn/armacraft/bridge/BridgeClient.java
++++ b/host/src/main/java/gl/syn/armacraft/bridge/BridgeClient.java
+@@ -14,7 +14,9 @@
+ import java.net.Socket;
+ import java.nio.charset.StandardCharsets;
+ import java.util.ArrayList;
++import java.util.LinkedHashMap;
+ import java.util.List;
++import java.util.Map;
+ import java.util.concurrent.ConcurrentLinkedQueue;
+ import java.util.concurrent.LinkedBlockingQueue;
+ import java.util.concurrent.TimeUnit;
+@@ -37,6 +39,8 @@
+ 	private static final int CONNECT_TIMEOUT_MS = 3000;
+ 	private static final long BACKOFF_MIN_MS = 500;
+ 	private static final long BACKOFF_MAX_MS = 10_000;
++	/** Ask guests that offer it for `delta` snapshots (-Darmacraft.delta=false keeps full v1 snapshots). */
++	static final boolean USE_DELTA = Boolean.parseBoolean(System.getProperty("armacraft.delta", "true"));
+ 
+ 	private final AtomicReference<Msg.@Nullable State> latestState = new AtomicReference<>();
+ 	private final ConcurrentLinkedQueue<Msg> inbound = new ConcurrentLinkedQueue<>();
+@@ -45,6 +49,8 @@
+ 	static final int MAX_INBOUND = 4096;
+ 	private final LinkedBlockingQueue<String> outbound = new LinkedBlockingQueue<>(8192);
+ 	private final AtomicInteger epoch = new AtomicInteger();
++	/** Wall set rebuilt from `delta` messages. Bridge (reader) thread only. */
++	private final Map<Long, Msg.Wall> deltaWalls = new LinkedHashMap<>();
+ 
+ 	private volatile boolean running;
+ 	private volatile boolean connected;
+@@ -243,8 +249,14 @@
+ 		}
+ 		switch (m) {
+ 			case Msg.State st -> latestState.set(st);
++			case Msg.Delta d -> applyDelta(d);
+ 			case Msg.Hello h -> {
+ 				hello = h;
++				deltaWalls.clear();
++				if (USE_DELTA && h.features().contains("delta")) {
++					// v1 guests never offer it; a guest that does switches to `delta` lines after this
++					send(Protocol.hello(List.of("delta")));
++				}
+ 				enqueue(h);
+ 			}
+ 			case Msg.Unknown u -> {
+@@ -252,6 +264,24 @@
+ 			}
+ 			default -> enqueue(m);
+ 		}
++	}
++
++	/**
++	 * Bridge thread only. Folds a delta into the current wall set and publishes a full State, so the server
++	 * thread is unchanged. Unchanged walls keep their record instances across snapshots, which lets the
++	 * renderer's memo hit on identity.
++	 */
++	private void applyDelta(Msg.Delta d) {
++		if (d.key()) {
++			deltaWalls.clear();
++		}
++		for (long id : d.removed()) {
++			deltaWalls.remove(id);
++		}
++		for (Msg.Wall w : d.walls()) {
++			deltaWalls.put(w.id(), w);
++		}
++		latestState.set(new Msg.State(d.t(), d.cycles(), List.copyOf(deltaWalls.values()), d.receivedNanos()));
+ 	}
+ 
+ 	private void writeLoop(OutputStream out) {

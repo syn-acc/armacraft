@@ -1,0 +1,17 @@
+{
+	"schemaVersion": 1,
+	"id": "armacraft_client-gametest",
+	"version": "${version}",
+	"name": "armacraft client game tests",
+	"description": "Client game test for the armacraft_client relay path (real dev client, singleplayer, host relay). Not shipped.",
+	"license": "GPL-2.0-or-later",
+	"environment": "client",
+	"entrypoints": {
+		"fabric-client-gametest": ["gl.syn.armacraft.client.gametest.RelayClientGameTest", "gl.syn.armacraft.client.gametest.RideVisualsClientGameTest"]
+	},
+	"depends": {
+		"armacraft_client": "*",
+		"armacraft": "*",
+		"fabric-client-gametest-api-v1": "*"
+	}
+}

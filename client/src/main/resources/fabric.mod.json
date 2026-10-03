@@ -1,0 +1,25 @@
+{
+	"schemaVersion": 1,
+	"id": "armacraft_client",
+	"version": "${version}",
+	"name": "armacraft client",
+	"description": "Optional client renderer for armacraft: draws the Armagetron Advanced arena with Armagetron's own cycle model, textures, walls, camera, sounds and HUD, rendered every frame with extrapolation.",
+	"authors": ["syn"],
+	"contributors": ["Armagetron Advanced authors (assets and replicated render/camera parameters, GPL-2.0-or-later)"],
+	"license": "GPL-2.0-or-later",
+	"environment": "client",
+	"entrypoints": {
+		"client": ["gl.syn.armacraft.client.ArmacraftClient"],
+		"armacraft:ride_visuals": ["gl.syn.armacraft.client.ridekit.ArmaRideVisuals"]
+	},
+	"mixins": [
+		{"config": "armacraft_client.mixins.json", "environment": "client"}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.5",
+		"minecraft": "~26.3",
+		"java": ">=25",
+		"fabric-api": "*",
+		"armacraft": "*"
+	}
+}

@@ -1,0 +1,43 @@
+// dev/play.ps1: export the play copy's runClient launch spec without editing the play copy.
+//
+//   gradlew --init-script dev/tools/play-export.init.gradle --no-configuration-cache -q armaExportRun -Parma.export=<file>
+//
+// Writes a line-based spec: the JVM args, classpath, main class, program args and working dir that
+// `gradlew runClient` would use. play.ps1 turns it into a java argfile, with the project's own
+// build/classes + build/resources entries replaced by the staged mod dir it controls.
+// Compiles nothing: it only depends on Loom's launch-config generators (launch.cfg, log4j.xml, assets).
+
+gradle.projectsEvaluated {
+	def p = gradle.rootProject
+	def run = p.tasks.findByName('runClient')
+	if (run == null) {
+		return
+	}
+	p.tasks.register('armaExportRun') {
+		// Loom's run tasks depend on these; taking them by name keeps the compile tasks out
+		['generateDLIConfig', 'generateLog4jConfig', 'generateRemapClasspath', 'configureClientLaunch', 'configureLaunch'].each { n ->
+			if (p.tasks.findByName(n) != null) {
+				dependsOn(n)
+			}
+		}
+		doLast {
+			def out = new File(p.property('arma.export').toString())
+			def lines = []
+			lines << "project=${p.projectDir.absolutePath}"
+			lines << "build=${p.layout.buildDirectory.get().asFile.absolutePath}"
+			lines << "main=${run.mainClass.get()}"
+			// Loom's RunGameTask (1.18): internalRunDir is the run dir, internalJvmArgs the run config's vmArgs plus the
+			// dev-launch-injector properties; the classpath goes into an @argfile at exec time, so it is exported here
+			def runDir = new File(run.internalRunDir.get().toString())
+			if (!runDir.absolute) {
+				runDir = new File(p.projectDir, runDir.path)
+			}
+			lines << "workdir=${runDir.absolutePath}"
+			run.internalJvmArgs.get().each { lines << "jvm=${it}" }
+			p.sourceSets.client.runtimeClasspath.files.each { lines << "cp=${it.absolutePath}" }
+			(run.args + run.argumentProviders.collectMany { it.asArguments() as List }).each { lines << "arg=${it}" }
+			out.parentFile.mkdirs()
+			out.setText(lines.join('\n') + '\n', 'UTF-8')
+		}
+	}
+}

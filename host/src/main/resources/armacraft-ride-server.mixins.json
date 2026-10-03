@@ -1,0 +1,12 @@
+{
+	"required": true,
+	"package": "gl.syn.armacraft.ride.server.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"mixins": [
+		"PlayerRideFallMixin",
+		"ServerGamePacketListenerImplRideMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	}
+}

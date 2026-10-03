@@ -1,0 +1,815 @@
+armacraft graphics patch 0003 -- UNAPPLIED. Opaque bike under shaderpacks, trail visible over water, no spikes at steps.
+
+User report (2026-10-02, play-shaders, Complementary + Euphoria, client 0.1.6): "the bike is also translucent and on
+water the line we leave behind is not visible as well as it is on land", plus red triangular spikes where the trail
+crosses 1-block steps. Three causes, three fixes; only the first is specific to Iris.
+
+1. Bike see-through under a shaderpack (Iris only)
+   Cause: 0.1.6 assigns every pipeline to IrisProgram.EMISSIVE_ENTITIES (gbuffers_spidereyes). Iris gives that program
+   a default blend override, SRC_ALPHA / ONE (ProgramId.SpiderEyes in Iris 1.11.7), which replaces the pipeline's own
+   blend state. The opaque MODEL pipeline is therefore drawn additively: washed-out pink over bright ground, and
+   whatever is behind the bike shows through it. (The same override is why trail walls are additive under a pack.)
+   Fix:
+   - IrisCompat assigns a program per pipeline: render.iris_model_program (bike, rim; default "entities" =
+     gbuffers_entities, opaque and pack-lit; the vertices already carry a full-bright lightmap, so it stays bright at
+     night), render.iris_wall_program (default "emissive": walls stay additive and glowing),
+     render.iris_light_program (light pool, floor grid; default "emissive"). render.iris_program keeps "off" and "lit"
+     (lit = walls through gbuffers_entities too, for packs with an empty spidereyes such as Alpha Piscium); any other
+     value, including the "emissive" already written to existing config files, now means "use the per-pipeline keys".
+   - ArmaRenderTypes: MODEL and SOLID_2S get the ALPHA_CUTOUT 0.1 define. Without it IrisApi.assignPipeline picks
+     ShaderKey.ENTITIES_ALPHA for gbuffers_entities (the first key of that program), whose alpha test discards every
+     fragment whose alpha is not above the vertex alpha: the bike was not drawn at all (seen in the first test run).
+     With the define it picks ENTITIES_CUTOUT (alpha > 0.1). In vanilla the define discards alpha < 0.1; the cycle and
+     rim textures are opaque.
+
+2. Trail and light pool faint or invisible over water (general: any classic-transparency frame)
+   Cause: SubmitNodeCollector.submitCustomGeometry puts blended render types into the "translucent custom geometry"
+   phase, which LevelRenderer.executeClassicTransparency draws BEFORE translucent terrain. Walls and light pools do
+   not write depth, so water, the frost walker's frosted ice (a translucent block) and glass are blended over them
+   afterwards. Classic transparency runs whenever "improved transparency" is off (it is off in this user's
+   options.txt) and always under Iris, which turns improved transparency off. Over a lake only the wall's top line
+   (which writes depth) survived.
+   Fix: new render/ArmaSubmit. Blended geometry (walls, light pool, floor grid, wall top lines) is submitted to the
+   after-terrain phase (SubmitNodeCollection.afterTerrain, where vanilla draws translucent particles), so it blends
+   over water like over land. With improved transparency on, all translucent phases are the same order-independent
+   phase, so nothing changes there. render.walls_after_water=false restores the old phase (/armac reload applies it).
+
+3. Spikes where the trail crosses 1-block steps (general: same with shaders off)
+   Cause, two parts, both in ArmaTrailVisual:
+   a. The join was put at the first block edge between the two trail points, or halfway when there was none. But the
+      rider is a 0.6 wide box: Entity.move lifts it when its FRONT reaches the block and lets it down when its BACK has
+      left it, so the recorded trail changes height up to 0.3 blocks before an up edge (measured: -0.068 for the edge
+      at 0, 17.930 for the edge at 18). Half of all up steps had no edge between the two points and got a join half a
+      block early: a piece of upper wall floating in front of the block face.
+   b. The wall is exactly as tall as the step (trail_height 1.0, 1-block step), so the lower wall's top edge is the
+      upper wall's bottom edge: the two levels touch along a line only. From the chase camera, behind and above, each
+      step reads as two triangles meeting in a point (an hourglass).
+   Fix:
+   a. stepJoin(): the join goes to the block edge passed by the rider's front (up) or back (down) during that move,
+      which may lie up to RIDER_HALF_WIDTH (0.3) outside the two points. An up join ahead of the newest point stays at
+      that point until the trail is seen to continue past the edge (so a turn at that point does not overshoot); a
+      down join behind the previous point pulls that point back to the edge.
+   b. render.trail_step_ramp (default 1.0 block of run per block of rise, 0 = old vertical joins): on the low side of a
+      step the wall top ramps up to the upper level, so the wall also covers the block face it climbs and both levels
+      form one surface. The bottom still follows the ground; the wall texture stretches over the taller part.
+
+Files: ArmacraftClient (init call, reload), ClientConfig (render.iris_model_program, iris_wall_program,
+iris_light_program, walls_after_water, trail_step_ramp), render/IrisCompat, render/ArmaRenderTypes, render/ArmaSubmit
+(new), render/ArenaRenderer and kit/BikeRenderer (submit through ArmaSubmit), ridekit/ArmaTrailVisual,
+ArmaTrailVisualTest. No camera files.
+
+Checked (2026-10-02, scratch copy of client/ taken 18:31 BST, built against host/):
+- git apply --check against client/ at 19:10 (after K's ClientConfig.Ride camera edits): clean.
+- ./gradlew jar test: BUILD SUCCESSFUL, 70 passed, 0 failed, 1 skipped (pre-existing skip). New tests:
+  recordedStepsJoinAtTheBlockFaces (trail points recorded in game, both headings),
+  stepUpAheadOfTheNewestPointWaitsForTheTrailToPassTheEdge, stepDownBehindThePreviousPointPullsItBackToTheEdge,
+  wallTopRampsUpToTheHigherLevelOnTheLowSideOfAStep; stepUpIsSplitAtTheBlockEdge and
+  stepWithoutEdgeCrossingJoinsHalfway got physically consistent inputs (the old inputs had the rider's front inside
+  the higher block one tick before it was lifted).
+- In game (play-shaders-tex, 1600x900, Patrix + Complementary/Euphoria "balanced-labpbr", and with shaders off),
+  screenshots in .work/play-shaders-tex/run-client/screenshots/:
+  - bike: bench_p5d_steps_{night,day}_shader.png (model on emissive = 0.1.6 look) against
+    bench_p5e_steps_{night,day}_shader.png (entities): solid, opaque, bright at night.
+  - water: bench_p5c_lake_{night,day}_before.png against _after.png (same frozen frame, walls_after_water toggled),
+    and bench_p5c_lake_day_vanilla_{before,after}.png with shaders off.
+  - steps: bench_p5b_steps_night_{vanilla,shader}.png (before) against bench_p5e_steps_night_{vanilla,shader}.png;
+    bursts bench_p5b_steps_<n>.png against bench_p5e_steps_<n>.png from the chase camera while climbing.
+  - final revision of this patch (wall top lines after terrain too), one run: bench_p5g_steps_night_{shader,vanilla}.png,
+    bench_p5g_lake_{night,day}.png, bench_p5g_lake_day_vanilla.png.
+  Repro for the steps: stone strips one block high across a flat platform (bench/p5g.txt has the /fill commands),
+  ride across, U-turn, ride back alongside the old wall.
+- Not run: arena mode (rim walls now also on gbuffers_entities, arena walls and floor grid after terrain), remote
+  riders, Alpha Piscium and Noble with the new defaults, iris_wall_program values other than emissive and
+  entities_translucent, improved transparency on.
+Apply from the repo root:  git apply docs/graphics-patches/0003-client-opaque-bike-water-trail-step-joins.patch
+
+diff --git a/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java b/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java
+index b0876f3..d82f2ad 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java
++++ b/client/src/client/java/gl/syn/armacraft/client/ArmacraftClient.java
+@@ -45,7 +45,8 @@ public final class ArmacraftClient implements ClientModInitializer {
+ 		ClientConfig cfg = ClientConfig.load(FabricLoader.getInstance().getConfigDir().resolve("armacraft_client.json"));
+ 		ArenaClient client = new ArenaClient(cfg);
+ 		ArmaRenderTypes.init();
+-		IrisCompat.init(cfg.render.irisProgram);
++		IrisCompat.init(cfg.render);
++		gl.syn.armacraft.client.render.ArmaSubmit.afterTerrain = cfg.render.wallsAfterWater;
+ 		ArmaKeys.init();
+ 		dev = new DevTools();
+ 		ArenaRenderer renderer = new ArenaRenderer(client);
+@@ -131,6 +132,7 @@ public final class ArmacraftClient implements ClientModInitializer {
+ 				ClientConfig fresh = ClientConfig.load(FabricLoader.getInstance().getConfigDir().resolve("armacraft_client.json"));
+ 				copy(fresh, cfg);
+ 				client.applyConfig();
++				gl.syn.armacraft.client.render.ArmaSubmit.afterTerrain = cfg.render.wallsAfterWater;
+ 				ArmaTextures.invalidate();
+ 				gl.syn.armacraft.client.ridekit.ArmaCamSettings.invalidate();
+ 				client.chooseTransport();
+diff --git a/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java b/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java
+index bd5b7b7..674d514 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java
++++ b/client/src/client/java/gl/syn/armacraft/client/ClientConfig.java
+@@ -91,11 +91,35 @@ public final class ClientConfig {
+ 		/** Line width (pixels) for wall top edges and explosion rays (GL default line width is 1). */
+ 		public double lineWidth = 2.0;
+ 		/**
+-		 * Shaderpack program for the armacraft pipelines under Iris (restart to change): "emissive" (gbuffers_spidereyes:
+-		 * glows, feeds bloom; Complementary, BSL and most OptiFine-lineage packs), "lit" (bike and walls through
+-		 * gbuffers_entities: for packs that draw nothing in spidereyes, e.g. Alpha Piscium), "off" (unassigned: broken geometry).
++		 * Iris shaderpack switch (restart to change): "off" leaves the armacraft pipelines unassigned (broken geometry,
++		 * for comparison only); "lit" also sends the walls through gbuffers_entities (packs that draw nothing in
++		 * spidereyes, e.g. Alpha Piscium); anything else uses the per-pipeline programs below.
+ 		 */
+ 		public String irisProgram = "emissive";
++		/**
++		 * Pack program for the bike and rim walls (opaque): "entities" (gbuffers_entities, pack-lit, full-bright
++		 * lightmap). Not "emissive": Iris blends gbuffers_spidereyes additively, which makes the bike see-through.
++		 */
++		public String irisModelProgram = "entities";
++		/**
++		 * Pack program for trail and arena walls: "emissive" (gbuffers_spidereyes: additive, glows, feeds bloom) or
++		 * "entities_translucent" (alpha blended and pack-lit: solid-looking walls in daylight, no glow).
++		 */
++		public String irisWallProgram = "emissive";
++		/** Pack program for the light pool and the floor grid (additive). */
++		public String irisLightProgram = "emissive";
++		/**
++		 * Draw walls and light pools after translucent terrain (water, ice, glass) instead of before it, so a trail
++		 * over a lake is as visible as on land. Matters with improved transparency off and under shaderpacks.
++		 */
++		public boolean wallsAfterWater = true;
++		/**
++		 * Ride trail at terrain steps: blocks of run over which the wall top ramps up to the higher level, per block
++		 * of rise, on the low side of the step (1 = 45 degrees). The wall then covers the block face it climbs, so
++		 * the two levels stay one surface. 0 = plain vertical joins: with a wall as tall as the step the two levels
++		 * only touch along a line and read as triangular spikes from the chase camera.
++		 */
++		public double trailStepRamp = 1.0;
+ 	}
+ 
+ 	public static final class Sound {
+@@ -242,6 +266,7 @@ public final class ClientConfig {
+ 		render.wallBodyBrightness = clamp(render.wallBodyBrightness, 0.05, 1);
+ 		render.maxExtrapolate = clamp(render.maxExtrapolate, 0, 1);
+ 		render.lineWidth = clamp(render.lineWidth, 0.5, 8);
++		render.trailStepRamp = clamp(render.trailStepRamp, 0, 4);
+ 		if (camera.mode == null || !(camera.mode.equals("custom") || camera.mode.equals("in"))) {
+ 			camera.mode = "custom";
+ 		}
+diff --git a/client/src/client/java/gl/syn/armacraft/client/kit/BikeRenderer.java b/client/src/client/java/gl/syn/armacraft/client/kit/BikeRenderer.java
+index b039adf..af1d191 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/kit/BikeRenderer.java
++++ b/client/src/client/java/gl/syn/armacraft/client/kit/BikeRenderer.java
+@@ -7,6 +7,7 @@ import gl.syn.armacraft.client.core.Mesh;
+ import gl.syn.armacraft.client.core.ModModel;
+ import gl.syn.armacraft.client.core.V2;
+ import gl.syn.armacraft.client.render.ArmaRenderTypes;
++import gl.syn.armacraft.client.render.ArmaSubmit;
+ import gl.syn.armacraft.client.render.ArmaTextures;
+ import net.minecraft.client.Minecraft;
+ import net.minecraft.client.renderer.SubmitNodeCollector;
+@@ -113,7 +114,8 @@ public final class BikeRenderer {
+ 		final float[] d = java.util.Arrays.copyOf(mesh.data(), mesh.vertexCount() * Mesh.STRIDE);
+ 		final int count = mesh.vertexCount();
+ 		final double ox = origin.x - cameraPos.x, oy = origin.y - cameraPos.y, oz = origin.z - cameraPos.z;
+-		out.submitCustomGeometry(poseStack, type, (pose, buf) -> emitQuads(pose, buf, d, count, ox, oy, oz, scale));
++		// blended types (walls, light pools) go after translucent terrain: see ArmaSubmit
++		ArmaSubmit.auto(out, poseStack, type, (pose, buf) -> emitQuads(pose, buf, d, count, ox, oy, oz, scale));
+ 	}
+ 
+ 	/** Armagetron (x, y, z) to camera-relative Minecraft (x, z, -y) * scale + offset. */
+diff --git a/client/src/client/java/gl/syn/armacraft/client/render/ArenaRenderer.java b/client/src/client/java/gl/syn/armacraft/client/render/ArenaRenderer.java
+index aaaf10a..a02ba71 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/render/ArenaRenderer.java
++++ b/client/src/client/java/gl/syn/armacraft/client/render/ArenaRenderer.java
+@@ -193,13 +193,15 @@ public final class ArenaRenderer {
+ 	private static void submit(SubmitNodeCollector out, PoseStack poseStack, RenderType type, Mesh mesh, Emit emit, boolean isLines) {
+ 		final float[] data = java.util.Arrays.copyOf(mesh.data(), mesh.vertexCount() * Mesh.STRIDE);
+ 		final int count = mesh.vertexCount();
+-		out.submitCustomGeometry(poseStack, type, (pose, buffer) -> {
++		SubmitNodeCollector.CustomGeometryRenderer renderer = (pose, buffer) -> {
+ 			if (isLines) {
+ 				emit.lines(pose, buffer, data, count);
+ 			} else {
+ 				emit.quads(pose, buffer, data, count);
+ 			}
+-		});
++		};
++		// blended types (walls, floor grid, lines) go after translucent terrain: see ArmaSubmit
++		ArmaSubmit.auto(out, poseStack, type, renderer);
+ 	}
+ 
+ 	/** Armagetron (x, y, z) to camera-relative Minecraft (x, z, -y) * scale. */
+diff --git a/client/src/client/java/gl/syn/armacraft/client/render/ArmaRenderTypes.java b/client/src/client/java/gl/syn/armacraft/client/render/ArmaRenderTypes.java
+index 1de298c..4f41695 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/render/ArmaRenderTypes.java
++++ b/client/src/client/java/gl/syn/armacraft/client/render/ArmaRenderTypes.java
+@@ -29,10 +29,19 @@ public final class ArmaRenderTypes {
+ 		return Identifier.fromNamespaceAndPath("armacraft_client", path);
+ 	}
+ 
++	/**
++	 * Alpha cutout of the opaque pipelines. Vanilla: fragments below it are discarded (the cycle and rim textures are
++	 * opaque, so nothing is). Iris: its API picks the pack shader variant from this define; without it an opaque
++	 * pipeline assigned to gbuffers_entities gets the "vertex alpha" variant (ShaderKey.ENTITIES_ALPHA), which discards
++	 * every fragment whose alpha is not above the vertex alpha, i.e. the whole bike.
++	 */
++	private static final float OPAQUE_CUTOUT = 0.1F;
++
+ 	/** Opaque, back-face culled (Armagetron enables GL_CULL_FACE for models). */
+ 	public static final RenderPipeline MODEL = RenderPipelines.register(
+ 		RenderPipeline.builder(RenderPipelines.ENTITY_NO_LIGHTMAP_SNIPPET, RenderPipelines.EYES_SNIPPET)
+ 			.withLocation(loc("pipeline/arma_model"))
++			.withShaderDefine("ALPHA_CUTOUT", OPAQUE_CUTOUT)
+ 			.withColorTargetState(ColorTargetState.DEFAULT)
+ 			.withDepthStencilState(DepthStencilState.DEFAULT)
+ 			.withCull(true)
+@@ -43,6 +52,7 @@ public final class ArmaRenderTypes {
+ 	public static final RenderPipeline SOLID_2S = RenderPipelines.register(
+ 		RenderPipeline.builder(RenderPipelines.ENTITY_NO_LIGHTMAP_SNIPPET, RenderPipelines.EYES_SNIPPET)
+ 			.withLocation(loc("pipeline/arma_solid_2s"))
++			.withShaderDefine("ALPHA_CUTOUT", OPAQUE_CUTOUT)
+ 			.withColorTargetState(ColorTargetState.DEFAULT)
+ 			.withDepthStencilState(DepthStencilState.DEFAULT)
+ 			.withCull(false)
+diff --git a/client/src/client/java/gl/syn/armacraft/client/render/ArmaSubmit.java b/client/src/client/java/gl/syn/armacraft/client/render/ArmaSubmit.java
+new file mode 100644
+index 0000000..44b5f24
+--- /dev/null
++++ b/client/src/client/java/gl/syn/armacraft/client/render/ArmaSubmit.java
+@@ -0,0 +1,58 @@
++package gl.syn.armacraft.client.render;
++
++import com.mojang.blaze3d.vertex.PoseStack;
++import net.minecraft.client.renderer.OrderedSubmitNodeCollector;
++import net.minecraft.client.renderer.SubmitNodeCollection;
++import net.minecraft.client.renderer.SubmitNodeCollector;
++import net.minecraft.client.renderer.feature.CustomFeatureRenderer;
++import net.minecraft.client.renderer.rendertype.RenderType;
++
++/**
++ * Submits Armagetron geometry in the right frame phase.
++ *
++ * <p>{@code SubmitNodeCollector.submitCustomGeometry} puts every blended render type into the "translucent custom
++ * geometry" phase, which classic transparency draws <em>before</em> translucent terrain (LevelRenderer
++ * .executeClassicTransparency: translucent features, translucent terrain, then the after-terrain phase). Walls and
++ * light pools do not write depth, so water, ice and glass drawn afterwards blend over them: a trail over a lake (the
++ * frost walker's frosted ice is a translucent block too) or behind a glass pane all but disappears. Classic
++ * transparency is what runs whenever "improved transparency" is off, and always under an Iris shaderpack (Iris turns
++ * improved transparency off).
++ *
++ * <p>{@link #blended} submits to the after-terrain phase instead (where vanilla draws translucent particles), so walls,
++ * their top lines and light pools blend over water like over land. With improved transparency on, every translucent phase is the
++ * same order-independent phase, so nothing changes there.
++ */
++public final class ArmaSubmit {
++
++	/** {@code render.walls_after_water}: false restores the vanilla phase (for comparison). */
++	public static volatile boolean afterTerrain = true;
++
++	private ArmaSubmit() {
++	}
++
++	/** Opaque geometry, or anything that should keep vanilla's phase for its render type. */
++	public static void plain(SubmitNodeCollector out, PoseStack poseStack, RenderType type, SubmitNodeCollector.CustomGeometryRenderer renderer) {
++		out.submitCustomGeometry(poseStack, type, renderer);
++	}
++
++	/** Blended geometry (walls, light pools, floor grid, wall top lines): drawn after translucent terrain. */
++	public static void blended(SubmitNodeCollector out, PoseStack poseStack, RenderType type, SubmitNodeCollector.CustomGeometryRenderer renderer) {
++		if (afterTerrain && type.hasBlending() && !type.isOutline()) {
++			OrderedSubmitNodeCollector ordered = out.order(0);
++			if (ordered instanceof SubmitNodeCollection collection) {
++				collection.afterTerrain.submit(new CustomFeatureRenderer.Submit(poseStack.last().copy(), type, renderer));
++				return;
++			}
++		}
++		out.submitCustomGeometry(poseStack, type, renderer);
++	}
++
++	/** {@link #blended} for blended render types, {@link #plain} for the rest. */
++	public static void auto(SubmitNodeCollector out, PoseStack poseStack, RenderType type, SubmitNodeCollector.CustomGeometryRenderer renderer) {
++		if (type.hasBlending()) {
++			blended(out, poseStack, type, renderer);
++		} else {
++			plain(out, poseStack, type, renderer);
++		}
++	}
++}
+diff --git a/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java b/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java
+index b90f73b..1f19f85 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java
++++ b/client/src/client/java/gl/syn/armacraft/client/render/IrisCompat.java
+@@ -1,5 +1,6 @@
+ package gl.syn.armacraft.client.render;
+ 
++import gl.syn.armacraft.client.ClientConfig;
+ import net.fabricmc.loader.api.FabricLoader;
+ import net.irisshaders.iris.api.v0.IrisApi;
+ import net.irisshaders.iris.api.v0.IrisProgram;
+@@ -19,16 +20,22 @@ import java.util.Locale;
+  * walls, light pool and arena floor turn into screen-filling garbage triangles, and they also miss the pack's TAA
+  * jitter. Assigning the pipelines to a pack program through the Iris API fixes both.
+  *
+- * <p>{@code render.iris_program} in armacraft_client.json picks the program (restart to change):
++ * <p>Each pipeline gets its own program (armacraft_client.json, restart to change):
+  * <ul>
+- *   <li>{@code emissive} (default): {@code gbuffers_spidereyes}, the program packs use for glowing entity parts
+- *       (vanilla's EYES pipeline, which ours are built from, goes there too). Unlit and boosted in OptiFine-lineage
+- *       packs (Complementary, BSL, ...), so bike, trails and light pool glow and feed the pack's bloom. Some packs
+- *       stub spidereyes out (Alpha Piscium 1.10 draws nothing there): use {@code lit} with those.</li>
+- *   <li>{@code lit}: bike, rim and trail walls through {@code gbuffers_entities} (pack-lit like a mob: sun shading,
+- *       specular; no glow); floor grid and light pool stay on spidereyes (not drawn where a pack stubs it out).</li>
+- *   <li>{@code off}: leave the pipelines unassigned (the broken state above; for comparison only).</li>
++ *   <li>{@code render.iris_model_program} (bike, rim walls; default {@code entities}): {@code gbuffers_entities}, the
++ *       opaque pack-lit entity program. The vertices carry a full-bright lightmap, so the bike stays bright at night.
++ *       It must not be {@code emissive}: Iris gives {@code gbuffers_spidereyes} an additive blend override
++ *       (SRC_ALPHA, ONE; ProgramId.SpiderEyes), whatever the pipeline's own blend state says, so an "opaque" bike
++ *       there is added onto the scene and comes out see-through and washed out.</li>
++ *   <li>{@code render.iris_wall_program} (trail and arena walls; default {@code emissive}): {@code gbuffers_spidereyes},
++ *       unlit, boosted and additive in OptiFine-lineage packs (Complementary, BSL, ...), so walls glow and feed the
++ *       pack's bloom. {@code entities_translucent} gives alpha-blended, pack-lit walls instead (no glow).</li>
++ *   <li>{@code render.iris_light_program} (light pool, floor grid; default {@code emissive}).</li>
+  * </ul>
++ * Values: {@code emissive}, {@code entities}, {@code entities_translucent}, {@code beacon} or any
++ * {@code IrisProgram} name. {@code render.iris_program}: {@code off} leaves the pipelines unassigned (the broken state
++ * above; for comparison only); {@code lit} forces the walls to {@code entities} as well (packs that draw nothing in
++ * spidereyes, e.g. Alpha Piscium); any other value uses the per-pipeline keys.
+  * Only loaded when Iris is present; Iris is a compile-only dependency.
+  */
+ public final class IrisCompat {
+@@ -39,39 +46,60 @@ public final class IrisCompat {
+ 	}
+ 
+ 	/** Call once at client init, after {@link ArmaRenderTypes#init()}. */
+-	public static void init(String mode) {
++	public static void init(ClientConfig.Render cfg) {
+ 		if (!FabricLoader.getInstance().isModLoaded("iris")) {
+ 			return;
+ 		}
+-		String m = mode == null ? "emissive" : mode.toLowerCase(Locale.ROOT);
++		String m = cfg.irisProgram == null ? "" : cfg.irisProgram.toLowerCase(Locale.ROOT);
+ 		if ("off".equals(m)) {
+ 			LOG.info("iris_program=off: armacraft pipelines left unassigned");
+ 			return;
+ 		}
+ 		try {
+-			Assign.run("lit".equals(m));
++			Assign.run(cfg.irisModelProgram, "lit".equals(m) ? "entities" : cfg.irisWallProgram, cfg.irisLightProgram);
+ 		} catch (Throwable t) {
+ 			// older Iris without assignPipeline (API < 0.3)
+ 			LOG.warn("could not assign armacraft pipelines to Iris programs: {}", t.toString());
+ 		}
+ 	}
+ 
++	/** Config value to IrisProgram enum name: the short names above, or any enum name in any case. */
++	static String programName(String value, String fallback) {
++		String v = value == null || value.isBlank() ? fallback : value.trim().toLowerCase(Locale.ROOT);
++		return switch (v) {
++			case "emissive", "spidereyes" -> "EMISSIVE_ENTITIES";
++			case "lit" -> "ENTITIES";
++			case "beacon", "beaconbeam" -> "BEACON_BEAM";
++			default -> v.toUpperCase(Locale.ROOT);
++		};
++	}
++
+ 	/** Separate class so nothing Iris-typed is resolved unless Iris is loaded. */
+ 	private static final class Assign {
+-		static void run(boolean lit) {
++		static void run(String model, String wall, String light) {
+ 			IrisApi api = IrisApi.getInstance();
+-			IrisProgram solid = lit ? IrisProgram.ENTITIES : IrisProgram.EMISSIVE_ENTITIES;
+-			IrisProgram wall = lit ? IrisProgram.ENTITIES : IrisProgram.EMISSIVE_ENTITIES;
+-			// light pool and floor grid stay emissive in both modes: through gbuffers_textured Alpha Piscium drew them as
+-			// opaque white quads; through its (empty) spidereyes they are simply not drawn, which is the right fallback
+-			IrisProgram additive = IrisProgram.EMISSIVE_ENTITIES;
++			IrisProgram solid = program(model, "entities");
++			// an opaque pipeline on spidereyes is drawn additively (see class comment): never what "model" means
++			if (solid == IrisProgram.EMISSIVE_ENTITIES) {
++				LOG.warn("iris_model_program=emissive draws the bike additively (see-through); use entities or beacon");
++			}
++			IrisProgram additive = program(light, "emissive");
+ 			assign(api, ArmaRenderTypes.MODEL, solid);
+ 			assign(api, ArmaRenderTypes.SOLID_2S, solid);
+-			assign(api, ArmaRenderTypes.WALL, wall);
++			assign(api, ArmaRenderTypes.WALL, program(wall, "emissive"));
+ 			assign(api, ArmaRenderTypes.ADDITIVE, additive);
+ 			// OIT_WALL / OIT_ADDITIVE are not needed: Iris turns improved transparency off while a pack is active.
+ 		}
+ 
++		private static IrisProgram program(String value, String fallback) {
++			try {
++				return IrisProgram.valueOf(programName(value, fallback));
++			} catch (IllegalArgumentException e) {
++				LOG.warn("unknown Iris program '{}', using {}", value, fallback);
++				return IrisProgram.valueOf(programName(fallback, fallback));
++			}
++		}
++
+ 		private static void assign(IrisApi api, RenderPipeline pipeline, IrisProgram program) {
+ 			try {
+ 				api.assignPipeline(pipeline, program);
+diff --git a/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java b/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java
+index b452956..a278ba9 100644
+--- a/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java
++++ b/client/src/client/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisual.java
+@@ -7,6 +7,7 @@ import gl.syn.armacraft.client.core.ArenaMesher;
+ import gl.syn.armacraft.client.core.Mesh;
+ import gl.syn.armacraft.client.kit.BikeRenderer;
+ import gl.syn.armacraft.client.render.ArmaRenderTypes;
++import gl.syn.armacraft.client.render.ArmaSubmit;
+ import gl.syn.armacraft.client.render.ArmaTextures;
+ import gl.syn.armacraft.client.ride.api.TrailVisual;
+ import net.minecraft.client.renderer.SubmitNodeCollector;
+@@ -22,8 +23,13 @@ import net.minecraft.world.phys.Vec3;
+  * <p>Minecraft additions: the ribbon follows the trail's 3D points (feet level, terrain height). A step (a height
+  * change between two neighbouring points that is a terrain step, not a fall) is drawn as two level walls joined
+  * vertically at the block edge where the ground changes, so walls step up and down with the terrain instead of
+- * slanting through blocks; falls keep their slope. Texture coordinates are anchored in world space, so the pattern
+- * does not slide when the tail is trimmed. The oldest {@code fadeLength} blocks fade towards the tail.
++ * slanting through blocks; falls keep their slope. The rider is a box, not a point: it is lifted when its front
++ * reaches the higher block and comes down when its back has left it, so the block edge lies up to
++ * {@link #RIDER_HALF_WIDTH} ahead of the first raised point, or behind the last one (see {@link #stepJoin}).
++ * On the low side of a step the wall top ramps up to the higher level ({@code render.trail_step_ramp}, see
++ * {@link #rampExtra}), so the wall also covers the block face it climbs and the two levels form one surface.
++ * Texture coordinates are anchored in world space, so the pattern does not slide when the tail is trimmed. The
++ * oldest {@code fadeLength} blocks fade towards the tail.
+  *
+  * <p>Ride trails are player walls and are always drawn at full height: Armagetron 0.4 lowers only rim walls for
+  * CAMERA_VISIBILITY_LOWER_WALL (gWallRim::OnBlocksCamera, gWall.cpp 504-526; player walls inherit the no-op at
+@@ -35,6 +41,12 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 	/** A height change this small or larger over a horizontal run this short is a terrain step (blocks). */
+ 	private static final double STEP_MAX_RISE = 1.3;
+ 	private static final double STEP_MAX_RUN = 2.5;
++	/**
++	 * Half the width of the rider's collision box (the vanilla player's 0.6 wide box). Entity.move steps the box up
++	 * when its front face meets the block and lets it down when its back face has left the block, so recorded trail
++	 * points change height this far before an up edge and this far after a down edge.
++	 */
++	static final double RIDER_HALF_WIDTH = 0.3;
+ 	/** Subdivisions of the head section (Armagetron: segs 5). */
+ 	private static final int HEAD_SEGS = 8;
+ 
+@@ -46,6 +58,9 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 	private double[] py = new double[256];
+ 	private double[] pz = new double[256];
+ 	private int n;
++	// an up step whose block edge lies ahead of the newest point: index of the join's lower point, the edge, the heading
++	private int pendJoin = -1;
++	private double pendX, pendZ, pendDx, pendDz;
+ 
+ 	public ArmaTrailVisual(java.util.function.DoubleSupplier blocksPerUnit) {
+ 		this.blocksPerUnit = blocksPerUnit;
+@@ -100,6 +115,7 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 		double ox = px[n - 1];
+ 		double oy = py[n - 1];
+ 		double oz = pz[n - 1];
++		double ramp = cfg.render.trailStepRamp;
+ 		for (int i = 0; i + 1 < n; i++) {
+ 			double hx = px[i + 1] - px[i];
+ 			double hz = pz[i + 1] - pz[i];
+@@ -108,17 +124,26 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 			if (len <= 1e-6) {
+ 				continue;
+ 			}
++			if (ramp > 0 && run <= 1e-6 && stepJoinAt(i)) {
++				continue; // the ramps of the lower run already carry the top edge across this join
++			}
+ 			double intensity = run > 1e-6 ? .7 + .3 * (hx * hx) / (run * run) : 1;
+ 			double hSeg = h; // never lowered: see lowersTrailWalls
++			// this run is the low side of a step down at its start and/or a step up at its end: ramp the top there
++			double dropAtStart = ramp > 0 && run > 1e-6 && i >= 1 && stepJoinAt(i - 1) && py[i - 1] > py[i] ? py[i - 1] - py[i] : 0;
++			double riseAtEnd = ramp > 0 && run > 1e-6 && i + 2 < n && stepJoinAt(i + 1) && py[i + 2] > py[i + 1] ? py[i + 2] - py[i + 1] : 0;
+ 			// head section: subdivide so the curve is smooth
+ 			double fromHeadA = total - dist[i];
+ 			double fromHeadB = total - dist[i + 1];
+ 			int sub = head && fromHeadB < begLen ? Math.max(1, (int) Math.ceil(HEAD_SEGS * Math.min(len, fromHeadA - Math.max(0, fromHeadB)) / begLen)) : 1;
+-			for (int k = 0; k < sub; k++) {
+-				double fa = k / (double) sub;
+-				double fb = (k + 1) / (double) sub;
++			double[] cuts = cuts(sub, rampCuts(len, dropAtStart, riseAtEnd, ramp));
++			for (int k = 0; k + 1 < cuts.length; k++) {
++				double fa = cuts[k];
++				double fb = cuts[k + 1];
+ 				double[] va = vertexAt(i, fa, dist, total, head, begLen, hSeg, ppx, ppz, trail);
+ 				double[] vb = vertexAt(i, fb, dist, total, head, begLen, hSeg, ppx, ppz, trail);
++				va[3] += rampExtra(fa, len, dropAtStart, riseAtEnd, ramp);
++				vb[3] += rampExtra(fb, len, dropAtStart, riseAtEnd, ramp);
+ 				// va/vb: x, y(bottom), z, top height, whitening, alpha
+ 				float ra = clamp(r0 * intensity + va[4]);
+ 				float ga = clamp(g0 * intensity + va[4]);
+@@ -148,7 +173,7 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 			final double ly = oy - cam.y;
+ 			final double lz = oz - cam.z;
+ 			final float width = BikeRenderer.screenLineWidth(cfg.render.lineWidth);
+-			out.submitCustomGeometry(poseStack, RenderTypes.linesTranslucent(), (pose, buf) -> BikeRenderer.emitLines(pose, buf, d, count, lx, ly, lz, 1, width));
++			ArmaSubmit.blended(out, poseStack, RenderTypes.linesTranslucent(), (pose, buf) -> BikeRenderer.emitLines(pose, buf, d, count, lx, ly, lz, 1, width));
+ 		}
+ 	}
+ 
+@@ -202,6 +227,75 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 		return new double[] {x, y, z, height, white, alpha};
+ 	}
+ 
++	/** Polyline segment i is the vertical join of a terrain step (same place, a step's height apart). */
++	private boolean stepJoinAt(int i) {
++		return i >= 0 && i + 1 < n && Math.hypot(px[i + 1] - px[i], pz[i + 1] - pz[i]) <= 1e-6
++			&& Math.abs(py[i + 1] - py[i]) > 1e-3 && Math.abs(py[i + 1] - py[i]) <= STEP_MAX_RISE;
++	}
++
++	/**
++	 * Extra wall height at fraction f of a level run of length {@code len} that is the low side of a step: the top
++	 * starts {@code dropAtStart} higher (the level the trail came down from) and ends {@code riseAtEnd} higher (the
++	 * level it climbs to), each falling off linearly over {@code ramp} blocks per block of step. Two ramps that do not
++	 * fit in the run are shortened in proportion.
++	 */
++	static double rampExtra(double f, double len, double dropAtStart, double riseAtEnd, double ramp) {
++		if (!(ramp > 0) || !(len > 1e-9)) {
++			return 0;
++		}
++		double ld = dropAtStart * ramp;
++		double lu = riseAtEnd * ramp;
++		if (ld + lu > len) {
++			double k = len / (ld + lu);
++			ld *= k;
++			lu *= k;
++		}
++		double extra = 0;
++		if (ld > 1e-9) {
++			extra += dropAtStart * Math.max(0, 1 - f * len / ld);
++		}
++		if (lu > 1e-9) {
++			extra += riseAtEnd * Math.max(0, 1 - (1 - f) * len / lu);
++		}
++		return extra;
++	}
++
++	/** Fractions of the run where a ramp ends (the wall top has a corner there), inside (0, 1). */
++	static double[] rampCuts(double len, double dropAtStart, double riseAtEnd, double ramp) {
++		if (!(ramp > 0) || !(len > 1e-9) || (dropAtStart <= 0 && riseAtEnd <= 0)) {
++			return new double[0];
++		}
++		double ld = dropAtStart * ramp;
++		double lu = riseAtEnd * ramp;
++		if (ld + lu > len) {
++			double k = len / (ld + lu);
++			ld *= k;
++			lu *= k;
++		}
++		double a = ld / len;
++		double b = 1 - lu / len;
++		boolean hasA = ld > 1e-9 && a < 1 - 1e-9;
++		boolean hasB = lu > 1e-9 && b > 1e-9 && (!hasA || b > a + 1e-9);
++		return hasA && hasB ? new double[] {a, b} : hasA ? new double[] {a} : hasB ? new double[] {b} : new double[0];
++	}
++
++	/** 0, 1, the {@code sub} equal subdivisions and the extra fractions, sorted and without duplicates. */
++	private static double[] cuts(int sub, double[] extra) {
++		double[] all = new double[sub + 1 + extra.length];
++		for (int k = 0; k <= sub; k++) {
++			all[k] = k / (double) sub;
++		}
++		System.arraycopy(extra, 0, all, sub + 1, extra.length);
++		java.util.Arrays.sort(all);
++		int m = 1;
++		for (int k = 1; k < all.length; k++) {
++			if (all[k] - all[m - 1] > 1e-9) {
++				all[m++] = all[k];
++			}
++		}
++		return m == all.length ? all : java.util.Arrays.copyOf(all, m);
++	}
++
+ 	/** Mesh space is Armagetron-like (x east, y = -z, z up) relative to the origin, so BikeRenderer.emitQuads maps it back. */
+ 	private static void quad(Mesh m, double[] a, double ox, double oy, double oz, double ua, float ra, float ga, float ba,
+ 		double[] b, double ub, float rb, float gb, float bb) {
+@@ -224,6 +318,7 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 	/** Trail points + head, with terrain steps split into level runs joined vertically at the block edge. */
+ 	private void buildPolyline(Ribbon t) {
+ 		n = 0;
++		pendJoin = -1;
+ 		double[] p = t.points();
+ 		int count = Math.min(t.count(), p.length / 3);
+ 		for (int i = 0; i < count; i++) {
+@@ -276,6 +371,7 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 	}
+ 
+ 	private void add(double x, double y, double z) {
++		resolvePendingJoin(x, z);
+ 		if (n > 0) {
+ 			double lx = px[n - 1];
+ 			double ly = py[n - 1];
+@@ -288,17 +384,91 @@ public final class ArmaTrailVisual implements TrailVisual {
+ 				return; // duplicate
+ 			}
+ 			if (Math.abs(rise) > 1e-3 && Math.abs(rise) <= STEP_MAX_RISE && run > 1e-3 && run <= STEP_MAX_RUN) {
+-				// the ground changes at the first block edge crossed (or halfway if none is crossed)
+-				double f = edgeCrossing(lx, lz, x, z);
+-				double mx = lx + dx * f;
+-				double mz = lz + dz * f;
+-				push(mx, ly, mz);
+-				push(mx, y, mz);
++				double f = stepJoin(lx, lz, x, z, rise > 0);
++				if (f > 1) {
++					// up step, the block edge is ahead of this point: join here for now, and move the join out to the
++					// edge once the trail is seen to continue past it (resolvePendingJoin); a turn here keeps it
++					push(x, ly, z);
++					pendJoin = n - 1;
++					pendX = lx + dx * f;
++					pendZ = lz + dz * f;
++					pendDx = dx / run;
++					pendDz = dz / run;
++				} else if (f < 0) {
++					// down step, the block edge is behind the previous point: pull that point back to the edge if the
++					// level run it ends reaches back past the edge, else join at it
++					double ex = lx + dx * f;
++					double ez = lz + dz * f;
++					if (n >= 2 && Math.abs(py[n - 2] - ly) < 1e-6 && (ex - px[n - 2]) * dx + (ez - pz[n - 2]) * dz > 1e-9
++						&& Math.abs((lx - px[n - 2]) * dz - (lz - pz[n - 2]) * dx) < 1e-6 * run) {
++						px[n - 1] = ex;
++						pz[n - 1] = ez;
++						push(ex, y, ez);
++					} else {
++						push(lx, y, lz);
++					}
++				} else {
++					double mx = lx + dx * f;
++					double mz = lz + dz * f;
++					push(mx, ly, mz);
++					push(mx, y, mz);
++				}
+ 			}
+ 		}
+ 		push(x, y, z);
+ 	}
+ 
++	/** The next point after an up step whose edge was still ahead: if the trail carried on past the edge, join there. */
++	private void resolvePendingJoin(double x, double z) {
++		int j = pendJoin;
++		pendJoin = -1;
++		if (j < 0 || j + 1 >= n) {
++			return; // none, or cut off at the head
++		}
++		double ax = x - px[j];
++		double az = z - pz[j];
++		double along = ax * pendDx + az * pendDz;
++		double side = Math.abs(ax * pendDz - az * pendDx);
++		double edge = (pendX - px[j]) * pendDx + (pendZ - pz[j]) * pendDz;
++		if (side < 1e-6 && along >= edge - 1e-9) {
++			px[j] = pendX;
++			pz[j] = pendZ;
++			px[j + 1] = pendX;
++			pz[j + 1] = pendZ;
++		}
++	}
++
++	/**
++	 * Where the ground changes for a step between two neighbouring trail points, as a fraction of the way from the
++	 * first to the second: the block edge crossed by the rider's front (up step) or back (down step) during that
++	 * move. Below 0 or above 1 when that edge lies outside the two points (at most {@link #RIDER_HALF_WIDTH} away).
++	 * Without such an edge (not a block step): the first block edge between the points, or halfway.
++	 */
++	static double stepJoin(double x1, double z1, double x2, double z2, boolean up) {
++		double best = Double.NaN;
++		double bestDist = Double.MAX_VALUE;
++		double[][] axes = {{x1, x2}, {z1, z2}};
++		for (double[] a : axes) {
++			double d = a[1] - a[0];
++			if (Math.abs(d) < 1e-6) {
++				continue;
++			}
++			// the face that decides: front for up, back for down, in the direction of travel
++			double shift = (up ? RIDER_HALF_WIDTH : -RIDER_HALF_WIDTH) * Math.signum(d);
++			double lo = Math.min(a[0], a[1]) + shift;
++			double hi = Math.max(a[0], a[1]) + shift;
++			// edges the face passed during the move: (from, to] in travel order
++			for (double e = d > 0 ? Math.floor(lo) + 1 : Math.ceil(hi) - 1; d > 0 ? e <= hi + 1e-9 : e >= lo - 1e-9; e += d > 0 ? 1 : -1) {
++				double mid = Math.abs((e - shift - a[0]) / d - 0.5);
++				if (mid < bestDist) {
++					bestDist = mid;
++					best = (e - a[0]) / d;
++				}
++			}
++		}
++		return Double.isNaN(best) ? edgeCrossing(x1, z1, x2, z2) : best;
++	}
++
+ 	private static double edgeCrossing(double x1, double z1, double x2, double z2) {
+ 		double best = 0.5;
+ 		double bestDist = Double.MAX_VALUE;
+diff --git a/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java b/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java
+index 78d4e91..e613149 100644
+--- a/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java
++++ b/client/src/test/java/gl/syn/armacraft/client/ridekit/ArmaTrailVisualTest.java
+@@ -15,11 +15,72 @@ class ArmaTrailVisualTest {
+ 
+ 	@Test
+ 	void stepUpIsSplitAtTheBlockEdge() {
+-		double[][] p = poly(new double[] {0.2, 64, 0.5, 0.9, 64, 0.5, 1.8, 65, 0.5}, null);
++		// the front of the rider box (x + 0.3) passes x = 1 during the last move
++		double[][] p = poly(new double[] {0.2, 64, 0.5, 0.65, 64, 0.5, 1.55, 65, 0.5}, null);
+ 		assertEquals(5, p.length);
+ 		assertArrayEquals(new double[] {1.0, 64, 0.5}, p[2], 1e-9);
+ 		assertArrayEquals(new double[] {1.0, 65, 0.5}, p[3], 1e-9, "vertical join at x = 1");
+-		assertArrayEquals(new double[] {1.8, 65, 0.5}, p[4], 1e-9);
++		assertArrayEquals(new double[] {1.55, 65, 0.5}, p[4], 1e-9);
++	}
++
++	/**
++	 * Trail recorded in game (play-shaders-tex bench p5b, 18 b/s): stone strips one block high at x 0..2 and 8..10.
++	 * The rider is lifted when its front reaches a strip, 0.07 blocks before the edge at x = 0: the wall must stay
++	 * on the ground up to the block face instead of rising in mid-air half a block early (the "spikes" at steps).
++	 */
++	@Test
++	void recordedStepsJoinAtTheBlockFaces() {
++		double[][] p = poly(new double[] {-20.5, 151, 0.5, -0.967, 151, 0.5, -0.068, 152, 0.5, 2.631, 152, 0.5, 3.531, 151, 0.5,
++			7.130, 151, 0.5, 8.030, 152, 0.5, 10.730, 152, 0.5, 11.630, 151, 0.5}, null);
++		double[][] want = {{-20.5, 151}, {-0.967, 151}, {0, 151}, {0, 152}, {2.631, 152}, {3, 152}, {3, 151}, {3.531, 151},
++			{7.130, 151}, {8, 151}, {8, 152}, {8.030, 152}, {10.730, 152}, {11, 152}, {11, 151}, {11.630, 151}};
++		assertEquals(want.length, p.length);
++		for (int i = 0; i < want.length; i++) {
++			assertEquals(want[i][0], p[i][0], 1e-9, "x of point " + i);
++			assertEquals(want[i][1], p[i][1], 1e-9, "y of point " + i);
++		}
++		for (int i = 1; i < p.length; i++) {
++			assertTrue(p[i][0] >= p[i - 1][0] - 1e-9, "the wall never runs backwards: point " + i);
++		}
++		// the way back (heading -x) over a two block high stair at x 16..21 / 18..19
++		double[][] q = poly(new double[] {22.726, 151, -7.5, 21.828, 152, -7.5, 20.929, 152, -7.5, 20.030, 153, -7.5, 18.231, 153, -7.5,
++			17.332, 152, -7.5, 16.432, 152, -7.5, 15.532, 151, -7.5}, null);
++		double[][] wantBack = {{22.726, 151}, {22, 151}, {22, 152}, {21.828, 152}, {20.929, 152}, {20, 152}, {20, 153}, {18.231, 153},
++			{18, 153}, {18, 152}, {17.332, 152}, {16.432, 152}, {16, 152}, {16, 151}, {15.532, 151}};
++		assertEquals(wantBack.length, q.length);
++		for (int i = 0; i < wantBack.length; i++) {
++			assertEquals(wantBack[i][0], q[i][0], 1e-9, "x of point " + i + " (back)");
++			assertEquals(wantBack[i][1], q[i][1], 1e-9, "y of point " + i + " (back)");
++		}
++	}
++
++	@Test
++	void stepUpAheadOfTheNewestPointWaitsForTheTrailToPassTheEdge() {
++		// lifted at x = -0.068, the block face is at x = 0: nothing recorded beyond it yet, so the join stays at the point
++		double[][] p = poly(new double[] {-0.967, 151, 0.5, -0.068, 152, 0.5}, null);
++		assertEquals(3, p.length);
++		assertArrayEquals(new double[] {-0.068, 151, 0.5}, p[1], 1e-9);
++		assertArrayEquals(new double[] {-0.068, 152, 0.5}, p[2], 1e-9);
++		// a turn at the lifted point: the wall must not overshoot the corner
++		double[][] t = poly(new double[] {-0.967, 151, 0.5, -0.068, 152, 0.5, -0.068, 152, 3.5}, null);
++		assertArrayEquals(new double[] {-0.068, 151, 0.5}, t[1], 1e-9);
++		assertArrayEquals(new double[] {-0.068, 152, 0.5}, t[2], 1e-9);
++		// the head past the edge: the wall climbs at the edge
++		double[][] h = poly(new double[] {-0.967, 151, 0.5, -0.068, 152, 0.5}, new Vec3(0.4, 152, 0.5));
++		assertEquals(5, h.length);
++		assertArrayEquals(new double[] {0, 151, 0.5}, h[2], 1e-9);
++		assertArrayEquals(new double[] {0, 152, 0.5}, h[3], 1e-9);
++		assertArrayEquals(new double[] {0.4, 152, 0.5}, h[4], 1e-9);
++	}
++
++	@Test
++	void stepDownBehindThePreviousPointPullsItBackToTheEdge() {
++		// the back of the box (x - 0.3) leaves the block at x = 3 between x = 3.2 and x = 4.1
++		double[][] p = poly(new double[] {1.0, 152, 0.5, 3.2, 152, 0.5, 4.1, 151, 0.5}, null);
++		assertEquals(4, p.length);
++		assertArrayEquals(new double[] {3.0, 152, 0.5}, p[1], 1e-9, "no wall floating past the edge");
++		assertArrayEquals(new double[] {3.0, 151, 0.5}, p[2], 1e-9);
++		assertArrayEquals(new double[] {4.1, 151, 0.5}, p[3], 1e-9);
+ 	}
+ 
+ 	@Test
+@@ -61,11 +122,34 @@ class ArmaTrailVisualTest {
+ 		assertFalse(ArmaTrailVisual.lowersTrailWalls(false, true));
+ 	}
+ 
++	@Test
++	void wallTopRampsUpToTheHigherLevelOnTheLowSideOfAStep() {
++		// 5 block run that climbs one block at its end: full height until 1 block before the face, then 45 degrees
++		assertEquals(0, ArmaTrailVisual.rampExtra(0, 5, 0, 1, 1), 1e-9);
++		assertEquals(0, ArmaTrailVisual.rampExtra(0.8, 5, 0, 1, 1), 1e-9);
++		assertEquals(0.5, ArmaTrailVisual.rampExtra(0.9, 5, 0, 1, 1), 1e-9);
++		assertEquals(1, ArmaTrailVisual.rampExtra(1, 5, 0, 1, 1), 1e-9, "at the face the wall reaches the top of the upper wall");
++		assertArrayEquals(new double[] {0.8}, ArmaTrailVisual.rampCuts(5, 0, 1, 1), 1e-9);
++		// came down one block at the start
++		assertEquals(1, ArmaTrailVisual.rampExtra(0, 5, 1, 0, 1), 1e-9);
++		assertEquals(0, ArmaTrailVisual.rampExtra(0.2, 5, 1, 0, 1), 1e-9);
++		assertArrayEquals(new double[] {0.2}, ArmaTrailVisual.rampCuts(5, 1, 0, 1), 1e-9);
++		// a one block wide trench: both ramps shortened to half a block, a V
++		assertEquals(1, ArmaTrailVisual.rampExtra(0, 1, 1, 1, 1), 1e-9);
++		assertEquals(0, ArmaTrailVisual.rampExtra(0.5, 1, 1, 1, 1), 1e-9);
++		assertEquals(1, ArmaTrailVisual.rampExtra(1, 1, 1, 1, 1), 1e-9);
++		assertArrayEquals(new double[] {0.5}, ArmaTrailVisual.rampCuts(1, 1, 1, 1), 1e-9);
++		// render.trail_step_ramp 0: plain vertical joins
++		assertEquals(0, ArmaTrailVisual.rampExtra(1, 5, 0, 1, 0), 1e-9);
++		assertEquals(0, ArmaTrailVisual.rampCuts(5, 1, 1, 0).length);
++	}
++
+ 	@Test
+ 	void stepWithoutEdgeCrossingJoinsHalfway() {
+-		double[][] p = poly(new double[] {0.1, 64, 0.5, 0.7, 64.5, 0.5}, null);
++		// no block edge passed by the rider's front, none between the points: not a block step, join halfway
++		double[][] p = poly(new double[] {0.1, 64, 0.5, 0.35, 64.5, 0.5}, null);
+ 		assertEquals(4, p.length);
+-		assertEquals(0.4, p[1][0], 1e-9);
++		assertEquals(0.225, p[1][0], 1e-9);
+ 		assertEquals(64, p[1][1], 1e-9);
+ 		assertEquals(64.5, p[2][1], 1e-9);
+ 	}

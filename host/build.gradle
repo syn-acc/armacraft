@@ -1,0 +1,181 @@
+plugins {
+	id 'net.fabricmc.fabric-loom' version "${loom_version}"
+}
+
+repositories {
+	mavenCentral()
+}
+
+// Split environment source sets: src/main = common + dedicated server (vanilla clients can join arena mode),
+// src/client = client-only (ride mode driving, placeholder renderer, chase cam, HUD). One jar for both:
+// server-only for vanilla clients, client+server in singleplayer. Loom refuses main -> client references.
+loom {
+	splitEnvironmentSourceSets()
+}
+
+sourceSets {
+	// Headless in-world tests (Fabric GameTest) and the client gametest (real dev client). Not part of the
+	// shipped jar. Compiled against the client source set too, because ArmacraftClientGameTest drives the client.
+	gametest {
+		compileClasspath += sourceSets.main.compileClasspath + sourceSets.main.output
+		compileClasspath += sourceSets.client.compileClasspath + sourceSets.client.output
+		runtimeClasspath += sourceSets.main.runtimeClasspath + sourceSets.main.output
+		runtimeClasspath += sourceSets.client.runtimeClasspath + sourceSets.client.output
+	}
+}
+
+loom {
+	mods {
+		"armacraft" {
+			sourceSet sourceSets.main
+			sourceSet sourceSets.client
+		}
+		"armacraft-gametest" {
+			sourceSet sourceSets.gametest
+		}
+	}
+
+	runs {
+		// ./gradlew runClient : dev client with armacraft (ride mode: R). Own run dir so it can run next to runServer
+		// (which uses run/). Singleplayer does not read eula.txt.
+		client {
+			runDir "run-client"
+			programArgs "--username", "Syn"
+		}
+
+		// dev hotswap (dev/host.ps1 hotswap -TargetPid <runServer pid>): allow the attach agent; with
+		// -Parmacraft.jbr (gradle started with JAVA_HOME = a JetBrains Runtime) also structural changes.
+		server {
+			vmArg "-XX:+EnableDynamicAgentLoading"
+			if (project.hasProperty("armacraft.jbr")) {
+				vmArg "-XX:+AllowEnhancedClassRedefinition"
+			}
+		}
+
+		// ./gradlew runGametest
+		//   -Parmacraft.gametest.guest=127.0.0.1:4600  run the bridge phase against tools/fake_guest.py instead of the in-process guest
+		//   -Parmacraft.gametest.soak=127.0.0.1:4600   run only the 600-tick soak against a live guest
+		// Uses Fabric API's headless GameTest server; it never writes eula=true.
+		gametest {
+			server()
+			name = "Game Test"
+			source sourceSets.gametest
+			vmArg "-Dfabric-api.gametest"
+			vmArg "-Darmacraft.autoConnect=false"
+			vmArg "-Dfabric-api.gametest.report-file=${project.layout.buildDirectory.get().asFile}/gametest/junit.xml"
+			if (project.hasProperty("armacraft.gametest.guest")) {
+				vmArg "-Darmacraft.gametest.guest=${project.property('armacraft.gametest.guest')}"
+			}
+			if (project.hasProperty("armacraft.gametest.soak")) {
+				vmArg "-Darmacraft.gametest.soak=${project.property('armacraft.gametest.soak')}"
+			}
+			runDir "build/gametest"
+			ideConfigGenerated false
+		}
+
+		// ./gradlew runClientGametest : real dev client, real key presses, singleplayer world with armacraft.
+		//   -Parmacraft.clientgametest.guest=127.0.0.1:4535   use a live guest instead of the in-process one
+		//   -Parmacraft.clientgametest.server=localhost:25565 join a running dev server (runServer) instead
+		//   -Parmacraft.clientgametest.only=PHASE            one phase: arena, ride (course), controls, sync, smooth, visual,
+		//                                                    explore, remote (needs .server and .rcon=<server.properties>)
+		//   default: arena + ride + controls + sync
+		// Singleplayer and joining a server do not read eula.txt; nothing here writes it.
+		clientGametest {
+			client()
+			name = "Client Game Test"
+			source sourceSets.gametest
+			vmArg "-Dfabric.client.gametest"
+			vmArg "-Darmacraft.autoConnect=false"
+			if (project.hasProperty("armacraft.clientgametest.guest")) {
+				vmArg "-Darmacraft.clientgametest.guest=${project.property('armacraft.clientgametest.guest')}"
+			}
+			if (project.hasProperty("armacraft.clientgametest.server")) {
+				vmArg "-Darmacraft.clientgametest.server=${project.property('armacraft.clientgametest.server')}"
+			}
+			if (project.hasProperty("armacraft.clientgametest.rcon")) {
+				vmArg "-Darmacraft.clientgametest.rcon=${project.property('armacraft.clientgametest.rcon')}"
+			}
+			if (project.hasProperty("armacraft.clientgametest.only")) {
+				vmArg "-Darmacraft.clientgametest.only=${project.property('armacraft.clientgametest.only')}"
+			}
+			runDir "build/clientGametest"
+			ideConfigGenerated false
+		}
+	}
+}
+
+dependencies {
+	minecraft "com.mojang:minecraft:${project.minecraft_version}"
+	implementation "net.fabricmc:fabric-loader:${project.loader_version}"
+	implementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_api_version}"
+
+	testImplementation platform("org.junit:junit-bom:${project.junit_version}")
+	testImplementation "org.junit.jupiter:junit-jupiter"
+	testRuntimeOnly "org.junit.platform:junit-platform-launcher"
+}
+
+// Console input for the dev server, e.g. a terminal or `tail -f cmds.txt | ./gradlew runServer --no-configuration-cache`.
+tasks.matching { it.name == "runServer" }.configureEach {
+	standardInput = System.in
+}
+
+// In-game build stamp (BuildStamp: "[armacraft] build <time> \u00B7 client <version>" on join, in cycle mode and on
+// /arma whatsnew). Re-stamped only when main or client sources change, at execution time (the configuration cache
+// would freeze a time computed while configuring). Lands in the client resources via processClientResources.
+def armaBuildStamp = tasks.register("armaBuildStamp") {
+	def out = layout.buildDirectory.dir("generated/armaBuildStamp")
+	// the source dirs by path: sourceSets.client.allSource would include this task's own output
+	inputs.files(fileTree("src/main"), fileTree("src/client")).withPropertyName("sources")
+	outputs.dir(out)
+	doLast {
+		def dir = out.get().asFile
+		dir.mkdirs()
+		new File(dir, "armacraft-build.properties").setText(
+			"build=" + java.time.LocalDateTime.now().format(java.time.format.DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss")) + "\n", "UTF-8")
+	}
+}
+sourceSets.client.resources.srcDir(armaBuildStamp)
+
+processResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+processGametestResources {
+	def version = project.version
+	inputs.property "version", version
+
+	filesMatching("fabric.mod.json") {
+		expand "version": version
+	}
+}
+
+tasks.withType(JavaCompile).configureEach {
+	it.options.release = 25
+	it.options.encoding = "UTF-8"
+}
+
+java {
+	sourceCompatibility = JavaVersion.VERSION_25
+	targetCompatibility = JavaVersion.VERSION_25
+}
+
+test {
+	useJUnitPlatform()
+	// gradlew test -Parmacraft.ridediff=<recording.json> : replay a tools/ride_diff.py recording against the ride core
+	if (project.hasProperty("armacraft.ridediff")) {
+		systemProperty "armacraft.ridediff", project.property("armacraft.ridediff")
+		if (project.hasProperty("armacraft.ridediff.verbose")) {
+			systemProperty "armacraft.ridediff.verbose", "1"
+		}
+		outputs.upToDateWhen { false }
+	}
+	testLogging {
+		events "passed", "failed", "skipped"
+		exceptionFormat "full"
+	}
+}

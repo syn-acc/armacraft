@@ -1,0 +1,19 @@
+{
+	"required": true,
+	"package": "gl.syn.armacraft.client.mixin",
+	"compatibilityLevel": "JAVA_25",
+	"client": [
+		"CameraMixin",
+		"CreateWorldScreenInvoker",
+		"EntityRenderDispatcherMixin",
+		"GameRendererMixin",
+		"KeyboardHandlerMixin",
+		"KeyboardInputMixin"
+	],
+	"injectors": {
+		"defaultRequire": 1
+	},
+	"overwrites": {
+		"requireAnnotations": true
+	}
+}

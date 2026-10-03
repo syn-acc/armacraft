@@ -1,0 +1,6 @@
+{
+	"engine": {"sounds": [{"name": "armacraft_client:cyclrun"}]},
+	"turn": {"sounds": [{"name": "armacraft_client:turn"}]},
+	"explode": {"sounds": [{"name": "armacraft_client:expl"}]},
+	"spark": {"sounds": [{"name": "armacraft_client:spark"}]}
+}

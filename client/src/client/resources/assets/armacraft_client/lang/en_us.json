@@ -1,0 +1,15 @@
+{
+	"key.category.armacraft_client.riding": "armacraft (Armagetron)",
+	"key.armacraft_client.turn_left": "Turn left",
+	"key.armacraft_client.turn_left_alt": "Turn left (alt)",
+	"key.armacraft_client.turn_right": "Turn right",
+	"key.armacraft_client.turn_right_alt": "Turn right (alt)",
+	"key.armacraft_client.brake": "Brake",
+	"key.armacraft_client.brake_alt": "Brake (alt)",
+	"key.armacraft_client.brake_alt2": "Brake (alt 2)",
+	"key.armacraft_client.switch_view": "Switch camera",
+	"key.armacraft_client.glance_left": "Glance left",
+	"key.armacraft_client.glance_right": "Glance right",
+	"key.armacraft_client.glance_back": "Glance back",
+	"key.armacraft_client.arena_join": "Join / leave arena"
+}

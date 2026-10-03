@@ -1,0 +1,25 @@
+# build outputs and caches
+build/
+.gradle/
+bin/
+*.class
+
+# dev and test run directories: worlds, logs, crash reports, eula.txt, server.properties (RCON password)
+host/run/
+host/run-client/
+host/logs/
+client/run/
+client/logs/
+run/
+
+# scratch play copies: third-party mods, shaderpacks, resource packs, built jars, screenshots
+.work/
+
+# local machine state
+dev/.play/
+dev/mcserver/*
+!dev/mcserver/.gitkeep
+dev/paused-clipfarm-workers.txt
+dev/window-before.txt
+*.log
+hs_err_pid*

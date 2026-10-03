@@ -1,0 +1,33 @@
+armacraft perf patch 0001 -- UNAPPLIED. Render at START_SERVER_TICK instead of END_SERVER_TICK.
+
+Why: in Minecraft 26.3 entity changes go out from ChunkMap.tick() (ServerEntity.sendChanges), which
+runs inside ServerLevel.tick -> ServerChunkCache.tick. Fabric's START_SERVER_TICK is injected right
+before MinecraftServer.tickChildren (so before the level tick); END_SERVER_TICK is at the TAIL of
+tickServer (after it). The controller renders at END, so every snapTo / setTransformation made in
+tick N is only picked up by ChunkMap.tick in tick N+1: one extra tick (50 ms) on every
+snapshot -> client hop, for cycles, walls, names and the chase cam alike.
+
+Effect (estimated from code, not measured in a running server): -50 ms on all visual latency.
+Risk: low. Input handling (mixin) is untouched. Anything that relied on "render happened after the
+level tick" (nothing found in host/src) would see the update one tick earlier, not later.
+
+Base: host/src/main/java/gl/syn/armacraft/Armacraft.java as of 2026-10-02 00:05 BST.
+Checked: `git apply --check` against the working tree; host main + test + gametest sources compile
+with it (javac against the loom/Gradle cache jars). Not run in a server.
+Apply from the repo root:  git apply docs/perf-patches/0001-host-render-at-tick-start.patch
+(host/ files are CRLF; the patch carries CRLF context lines.)
+
+--- a/host/src/main/java/gl/syn/armacraft/Armacraft.java
++++ b/host/src/main/java/gl/syn/armacraft/Armacraft.java
+@@ -37,7 +37,10 @@
+ 
+ 		ServerLifecycleEvents.SERVER_STARTED.register(server -> controller.onServerStarted(server));
+ 		ServerLifecycleEvents.SERVER_STOPPING.register(server -> controller.onServerStopping(server));
+-		ServerTickEvents.END_SERVER_TICK.register(server -> {
++		// START, not END: 26.3 sends entity changes from ChunkMap.tick() inside the level tick, which runs
++		// after START_SERVER_TICK (injected right before tickChildren) but before END_SERVER_TICK (tickServer
++		// TAIL). Rendering at END left every display update queued for the *next* tick: +50 ms on every hop.
++		ServerTickEvents.START_SERVER_TICK.register(server -> {
+ 			try {
+ 				controller.tick(server);
+ 			} catch (RuntimeException e) {

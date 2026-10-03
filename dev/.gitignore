@@ -1,0 +1,6 @@
+# generated dev server state (world, libraries, logs, RCON password in server.properties)
+mcserver/*
+!mcserver/.gitkeep
+mcserver-*/
+# dev/play.ps1: compiled HotSwap tool + agent jar
+.play/

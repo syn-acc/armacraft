@@ -1,0 +1,13 @@
+--- a/src/tron/gGame.cpp	2026-10-02 00:16:54.795889294 +0000
++++ b/src/tron/gGame.cpp	2026-10-02 00:16:54.795889294 +0000
+@@ -1939,7 +1939,9 @@
+             st_DoToDo();
+             gGame::NetSyncIdle();
+ 
+-            sn_BasicNetworkSystem.Select( 1.0f );
++            // armacraft: poll the bridge listener often enough that a host connecting to a napping
++            // server gets its hello promptly (Select only watches the game UDP sockets)
++            sn_BasicNetworkSystem.Select( 0.1f );
+ 
+             // std::cout the players who are logged in:
+             numPlayers = sg_NumUsers();
